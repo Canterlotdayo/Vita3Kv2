@@ -261,12 +261,24 @@ bool ThreadState::run_loop() {
 
             // Run the cpu
             do {
+                // Lock the core mutex to serialize threads on the same CPU core.
+                // This prevents race conditions in guest code that assumes
+                // single-core cooperative scheduling (like Mono's class init).
+                int core_idx = 0;
+                if (affinity_mask & 0x10000) core_idx = 0;
+                else if (affinity_mask & 0x20000) core_idx = 1;
+                else if (affinity_mask & 0x40000) core_idx = 2;
+                // affinity_mask == 0 means "default" = any core, use core 0
+                kernel.core_mutex[core_idx].lock();
+
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
 
                 } else
                     res = run(*cpu);
+
+                kernel.core_mutex[core_idx].unlock();
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {

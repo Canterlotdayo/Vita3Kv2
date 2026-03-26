@@ -108,11 +108,32 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // Return 0 to let the calling code continue.
-    // In Mono, the assertion "pending init" fires when two threads try to
-    // initialize the same class concurrently. The code after the assertion
-    // re-reads the class flags and continues initialization normally.
-    // Killing the thread would prevent JIT compilation from completing.
+    // With per-core mutexes in the run_loop, the Mono "pending init" assertion
+    // should no longer fire. If it somehow still does, unwind abort()'s stack
+    // frame to return to the caller (g_error) instead of letting abort()
+    // proceed to sceKernelExitProcess which would kill everything.
+    //
+    // abort() does: push {r4, lr}; ...; blx sceKernelCallAbortHandler
+    // Stack: [SP+0]=saved r4, [SP+4]=saved LR (return to g_error caller)
+    if (thread && thread->cpu) {
+        uint32_t sp = read_sp(*thread->cpu);
+        Ptr<uint32_t> saved_r4_ptr(sp);
+        Ptr<uint32_t> saved_lr_ptr(sp + 4);
+
+        if (saved_r4_ptr.valid(emuenv.mem) && saved_lr_ptr.valid(emuenv.mem)) {
+            uint32_t saved_r4 = *saved_r4_ptr.get(emuenv.mem);
+            uint32_t saved_lr = *saved_lr_ptr.get(emuenv.mem);
+
+            LOG_WARN("Abort handler: unwinding abort() frame -> LR=0x{:08X}, r4=0x{:08X}",
+                     saved_lr, saved_r4);
+
+            write_reg(*thread->cpu, 4, saved_r4);
+            write_pc(*thread->cpu, saved_lr);
+            write_sp(*thread->cpu, sp + 8);
+            write_reg(*thread->cpu, 0, 0);
+        }
+    }
+
     return 0;
 }
 
