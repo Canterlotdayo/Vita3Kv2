@@ -20,6 +20,7 @@
 #include <kernel/thread/thread_data_queue.h>
 #include <kernel/types.h>
 #include <util/byte_ring_buffer.h>
+#include <util/safe_condition_variable.h>
 
 struct KernelState;
 
@@ -98,7 +99,7 @@ typedef std::map<SceUID, SimpleEventPtr> SimpleEventPtrs;
 
 struct Timer : SyncPrimitive {
     WaitingThreadQueuePtr waiting_threads;
-    std::condition_variable condvar;
+    SafeConditionVariable condvar;
 
     bool is_started = false;
     bool is_repeat = false;

@@ -20,6 +20,7 @@
 #include "../state.h"
 
 #include <condition_variable>
+#include <util/safe_condition_variable.h>
 
 #include <cubeb/cubeb.h>
 
@@ -33,7 +34,7 @@ struct CubebAudioOutPort : AudioOutPort {
     cubeb_stream_params spec;
     // sync variables used to wait for the buffer to be ready
     std::mutex mutex;
-    std::condition_variable cond_var;
+    SafeConditionVariable cond_var;
     // buffer filled with audio data to pass to cubeb
     std::vector<AudioBuffer> audio_buffers;
     // position of the next audio buffer to put audio

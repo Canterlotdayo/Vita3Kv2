@@ -27,6 +27,7 @@
 
 #include <array>
 #include <condition_variable>
+#include <util/safe_condition_variable.h>
 #include <memory>
 #include <mutex>
 
@@ -179,7 +180,7 @@ struct SceGxmSyncObject {
     uint32_t last_operation_global = 0;
 
     std::mutex lock;
-    std::condition_variable cond;
+    SafeConditionVariable cond;
 };
 
 struct GxmContextState {

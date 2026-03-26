@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <regex>
+#include <util/safe_condition_variable.h>
 
 namespace net_utils {
 
@@ -34,7 +35,7 @@ struct parsedUrl {
 };
 
 struct ProgressState {
-    std::condition_variable cv;
+    SafeConditionVariable cv;
     std::mutex mutex;
     bool download = true;
     bool pause = false;

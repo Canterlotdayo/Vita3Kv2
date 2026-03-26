@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <util/safe_condition_variable.h>
 
 template <typename T>
 class Queue {
@@ -121,8 +122,8 @@ public:
     }
 
 private:
-    std::condition_variable cond_;
-    std::condition_variable condempty_;
+    SafeConditionVariable cond_;
+    SafeConditionVariable condempty_;
     std::queue<T> queue_;
     std::mutex mutex_;
     std::atomic<bool> aborted{ false };

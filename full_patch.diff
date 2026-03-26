@@ -1,0 +1,339 @@
+diff --git a/vita3k/audio/include/audio/impl/cubeb_audio.h b/vita3k/audio/include/audio/impl/cubeb_audio.h
+index fda13f4..b3922f4 100644
+--- a/vita3k/audio/include/audio/impl/cubeb_audio.h
++++ b/vita3k/audio/include/audio/impl/cubeb_audio.h
+@@ -20,6 +20,7 @@
+ #include "../state.h"
+ 
+ #include <condition_variable>
++#include <util/safe_condition_variable.h>
+ 
+ #include <cubeb/cubeb.h>
+ 
+@@ -33,7 +34,7 @@ struct CubebAudioOutPort : AudioOutPort {
+     cubeb_stream_params spec;
+     // sync variables used to wait for the buffer to be ready
+     std::mutex mutex;
+-    std::condition_variable cond_var;
++    SafeConditionVariable cond_var;
+     // buffer filled with audio data to pass to cubeb
+     std::vector<AudioBuffer> audio_buffers;
+     // position of the next audio buffer to put audio
+diff --git a/vita3k/gui/src/bgm_player.cpp b/vita3k/gui/src/bgm_player.cpp
+index 1a535fb..e1700f9 100644
+--- a/vita3k/gui/src/bgm_player.cpp
++++ b/vita3k/gui/src/bgm_player.cpp
+@@ -23,6 +23,7 @@
+ #include <gui/functions.h>
+ #include <io/VitaIoDevice.h>
+ #include <io/state.h>
++#include <util/safe_condition_variable.h>
+ 
+ namespace gui {
+ 
+@@ -38,7 +39,7 @@ struct PcmData {
+     uint32_t write_buffer_index = 0;
+     uint32_t next_audio_buffer = 0;
+     uint32_t nb_buffers_ready = 0;
+-    std::condition_variable buffers_cv;
++    SafeConditionVariable buffers_cv;
+ };
+ 
+ struct At9Stream {
+@@ -53,7 +54,7 @@ struct At9Stream {
+     bool stop_requested;
+     PcmData pcm_data;
+ 
+-    std::condition_variable init_cv;
++    SafeConditionVariable init_cv;
+     std::mutex mutex;
+ };
+ 
+diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
+index b6e9f4b..80f0134 100644
+--- a/vita3k/io/src/io.cpp
++++ b/vita3k/io/src/io.cpp
+@@ -402,7 +402,7 @@ int write_file(SceUID fd, const void *data, const SceSize size, const IOState &i
+             } else {
+                 if (s.back() == '\n')
+                     s.pop_back();
+-                LOG_TRACE_IF(log_file_op, "*** TTY: {}", s);
++                LOG_WARN("*** TTY: {}", s);
+             }
+ 
+             return size;
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 374667a..881c195 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -20,6 +20,7 @@
+ #include <kernel/thread/thread_data_queue.h>
+ #include <kernel/types.h>
+ #include <util/byte_ring_buffer.h>
++#include <util/safe_condition_variable.h>
+ 
+ struct KernelState;
+ 
+@@ -98,7 +99,7 @@ typedef std::map<SceUID, SimpleEventPtr> SimpleEventPtrs;
+ 
+ struct Timer : SyncPrimitive {
+     WaitingThreadQueuePtr waiting_threads;
+-    std::condition_variable condvar;
++    SafeConditionVariable condvar;
+ 
+     bool is_started = false;
+     bool is_repeat = false;
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 90cf596..1fe69e8 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -27,6 +27,7 @@
+ #include <mutex>
+ #include <optional>
+ #include <string>
++#include <util/safe_condition_variable.h>
+ 
+ struct CPUContext;
+ 
+@@ -54,7 +55,7 @@ struct ThreadSignal {
+ 
+ private:
+     std::mutex mutex;
+-    std::condition_variable recv_cond;
++    SafeConditionVariable recv_cond;
+     bool signaled = false;
+ };
+ 
+@@ -89,7 +90,7 @@ struct ThreadState {
+ 
+     ThreadSignal signal;
+     std::vector<CallbackPtr> callbacks;
+-    std::condition_variable status_cond;
++    SafeConditionVariable status_cond;
+     std::vector<std::shared_ptr<ThreadState>> waiting_threads;
+     uint32_t returned_value = 0;
+ 
+@@ -126,7 +127,7 @@ private:
+ 
+     CPUContext init_cpu_ctx;
+     ThreadToDo to_do = ThreadToDo::wait;
+-    std::condition_variable something_to_do;
++    SafeConditionVariable something_to_do;
+ 
+     // if looking at the thread stack, the number of times run_loop appear
+     // if the thread is dormant, call_level is 0
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 7c757e5..3d7a1cb 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1106,7 +1106,21 @@ EXPORT(int, sceKernelBacktraceSelf) {
+ 
+ EXPORT(int, sceKernelCallModuleExit) {
+     TRACY_FUNC(sceKernelCallModuleExit);
+-    return UNIMPLEMENTED();
++
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
++    const char *tname = thread ? thread->name.c_str() : "unknown";
++    LOG_INFO("=== MODULE EXIT CALLED ===");
++    LOG_INFO("  Thread: {} (ID: {})", tname, thread_id);
++    if (thread && thread->cpu) {
++        auto ctx = save_context(*thread->cpu);
++        LOG_INFO("  CPU context:\n{}", ctx.description());
++    }
++    LOG_INFO("==========================");
++
++    // Do NOT call exit_delete() here — this function is called during normal
++    // module lifecycle (e.g. Unity plugin init/shutdown) and killing the thread
++    // causes condition_variable crashes in other threads still running.
++    return 0;
+ }
+ 
+ EXPORT(int, sceKernelCallWithChangeStack) {
+diff --git a/vita3k/modules/SceProcessmgr/SceProcessmgr.cpp b/vita3k/modules/SceProcessmgr/SceProcessmgr.cpp
+index 37573a3..93f5791 100644
+--- a/vita3k/modules/SceProcessmgr/SceProcessmgr.cpp
++++ b/vita3k/modules/SceProcessmgr/SceProcessmgr.cpp
+@@ -18,6 +18,7 @@
+ #include "SceProcessmgr.h"
+ 
+ #include <io/functions.h>
++#include <cpu/functions.h>
+ #include <kernel/state.h>
+ #include <rtc/rtc.h>
+ 
+@@ -101,7 +102,22 @@ EXPORT(int, sceKernelCDialogSetLeaseLimit) {
+ 
+ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
+     TRACY_FUNC(sceKernelCallAbortHandler, param1, param2);
+-    return UNIMPLEMENTED();
++
++    // Dump full thread context for crash diagnosis
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
++    const char *tname = thread ? thread->name.c_str() : "unknown";
++    LOG_ERROR("=== ABORT HANDLER CALLED ===");
++    LOG_ERROR("  Thread: {} (ID: {})", tname, thread_id);
++    LOG_ERROR("  Params: 0x{:X}, 0x{:X}", param1, param2);
++    if (thread && thread->cpu) {
++        auto ctx = save_context(*thread->cpu);
++        LOG_ERROR("  CPU context:\n{}", ctx.description());
++    }
++    LOG_ERROR("============================");
++
++    // On a real Vita this calls the registered abort handler then terminates.
++    // Returning 0 allows the runtime to attempt recovery rather than hanging.
++    return 0;
+ }
+ 
+ EXPORT(int, sceKernelGetCurrentProcess) {
+diff --git a/vita3k/net/include/net/state.h b/vita3k/net/include/net/state.h
+index 4287491..0a3cb62 100644
+--- a/vita3k/net/include/net/state.h
++++ b/vita3k/net/include/net/state.h
+@@ -27,6 +27,7 @@
+ #include <map>
+ #include <mutex>
+ #include <thread>
++#include <util/safe_condition_variable.h>
+ 
+ typedef std::map<int, SocketPtr> NetSockets;
+ typedef std::map<int, EpollPtr> NetEpolls;
+@@ -51,7 +52,7 @@ struct NetCtlState {
+     bool inited = false;
+     std::thread adhocThread;
+     std::atomic<bool> adhocCondVarReady = false;
+-    std::condition_variable adhocCondVar;
++    SafeConditionVariable adhocCondVar;
+     SceNetCtlState adhocState = SCE_NET_CTL_STATE_DISCONNECTED;
+     SceNetCtlEventType adhocEvent = SCE_NET_CTL_EVENT_TYPE_NONE;
+     SceNetCtlEventType lastNotifiedAdhocEvent = SCE_NET_CTL_EVENT_TYPE_NONE;
+diff --git a/vita3k/renderer/include/renderer/gxm_types.h b/vita3k/renderer/include/renderer/gxm_types.h
+index 057cbb5..0619877 100644
+--- a/vita3k/renderer/include/renderer/gxm_types.h
++++ b/vita3k/renderer/include/renderer/gxm_types.h
+@@ -29,6 +29,7 @@
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
++#include <util/safe_condition_variable.h>
+ 
+ namespace renderer {
+ struct FragmentProgram;
+@@ -179,7 +180,7 @@ struct SceGxmSyncObject {
+     uint32_t last_operation_global = 0;
+ 
+     std::mutex lock;
+-    std::condition_variable cond;
++    SafeConditionVariable cond;
+ };
+ 
+ struct GxmContextState {
+diff --git a/vita3k/renderer/include/renderer/state.h b/vita3k/renderer/include/renderer/state.h
+index f9e32cd..fd7da3d 100644
+--- a/vita3k/renderer/include/renderer/state.h
++++ b/vita3k/renderer/include/renderer/state.h
+@@ -21,6 +21,7 @@
+ #include <renderer/commands.h>
+ #include <renderer/types.h>
+ #include <threads/queue.h>
++#include <util/safe_condition_variable.h>
+ 
+ #include <condition_variable>
+ #include <mutex>
+@@ -74,10 +75,10 @@ struct State {
+ 
+     GXPPtrMap gxp_ptr_map;
+     Queue<CommandList> command_buffer_queue;
+-    std::condition_variable command_finish_one;
++    SafeConditionVariable command_finish_one;
+     std::mutex command_finish_one_mutex;
+ 
+-    std::condition_variable notification_ready;
++    SafeConditionVariable notification_ready;
+     std::mutex notification_mutex;
+ 
+     std::vector<ShadersHash> shaders_cache_hashs;
+diff --git a/vita3k/renderer/include/renderer/vulkan/types.h b/vita3k/renderer/include/renderer/vulkan/types.h
+index 9981bbb..baa9b27 100644
+--- a/vita3k/renderer/include/renderer/vulkan/types.h
++++ b/vita3k/renderer/include/renderer/vulkan/types.h
+@@ -20,6 +20,7 @@
+ #include <renderer/texture_cache.h>
+ #include <renderer/types.h>
+ #include <shader/uniform_block.h>
++#include <util/safe_condition_variable.h>
+ #include <vkutil/objects.h>
+ 
+ struct MemState;
+@@ -319,7 +320,7 @@ struct VKContext : public renderer::Context {
+ 
+     // only used if memory mapping is enabled
+     std::mutex new_frame_mutex;
+-    std::condition_variable new_frame_condv;
++    SafeConditionVariable new_frame_condv;
+     std::thread gpu_request_wait_thread;
+     uint64_t last_frame_waited = 0;
+ 
+diff --git a/vita3k/threads/include/threads/queue.h b/vita3k/threads/include/threads/queue.h
+index dfd1c02..67aa659 100644
+--- a/vita3k/threads/include/threads/queue.h
++++ b/vita3k/threads/include/threads/queue.h
+@@ -24,6 +24,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <queue>
++#include <util/safe_condition_variable.h>
+ 
+ template <typename T>
+ class Queue {
+@@ -121,8 +122,8 @@ public:
+     }
+ 
+ private:
+-    std::condition_variable cond_;
+-    std::condition_variable condempty_;
++    SafeConditionVariable cond_;
++    SafeConditionVariable condempty_;
+     std::queue<T> queue_;
+     std::mutex mutex_;
+     std::atomic<bool> aborted{ false };
+diff --git a/vita3k/util/include/util/net_utils.h b/vita3k/util/include/util/net_utils.h
+index ee9e8be..0b12c8c 100644
+--- a/vita3k/util/include/util/net_utils.h
++++ b/vita3k/util/include/util/net_utils.h
+@@ -6,6 +6,7 @@
+ #include <condition_variable>
+ #include <cstdint>
+ #include <regex>
++#include <util/safe_condition_variable.h>
+ 
+ namespace net_utils {
+ 
+@@ -34,7 +35,7 @@ struct parsedUrl {
+ };
+ 
+ struct ProgressState {
+-    std::condition_variable cv;
++    SafeConditionVariable cv;
+     std::mutex mutex;
+     bool download = true;
+     bool pause = false;
+diff --git a/vita3k/util/include/util/pool.h b/vita3k/util/include/util/pool.h
+index 0f24a35..9b13151 100644
+--- a/vita3k/util/include/util/pool.h
++++ b/vita3k/util/include/util/pool.h
+@@ -22,6 +22,7 @@
+ #include <map>
+ #include <mutex>
+ #include <set>
++#include <util/safe_condition_variable.h>
+ #include <vector>
+ 
+ template <typename T>
+@@ -60,7 +61,7 @@ private:
+     }
+ 
+     std::mutex mutex;
+-    std::condition_variable cond;
++    SafeConditionVariable cond;
+     std::vector<Ptr> items;
+     std::set<int> free_ids;

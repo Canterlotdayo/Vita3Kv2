@@ -21,6 +21,7 @@
 #include <renderer/commands.h>
 #include <renderer/types.h>
 #include <threads/queue.h>
+#include <util/safe_condition_variable.h>
 
 #include <condition_variable>
 #include <mutex>
@@ -74,10 +75,10 @@ struct State {
 
     GXPPtrMap gxp_ptr_map;
     Queue<CommandList> command_buffer_queue;
-    std::condition_variable command_finish_one;
+    SafeConditionVariable command_finish_one;
     std::mutex command_finish_one_mutex;
 
-    std::condition_variable notification_ready;
+    SafeConditionVariable notification_ready;
     std::mutex notification_mutex;
 
     std::vector<ShadersHash> shaders_cache_hashs;

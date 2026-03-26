@@ -23,6 +23,7 @@
 #include <gui/functions.h>
 #include <io/VitaIoDevice.h>
 #include <io/state.h>
+#include <util/safe_condition_variable.h>
 
 namespace gui {
 
@@ -38,7 +39,7 @@ struct PcmData {
     uint32_t write_buffer_index = 0;
     uint32_t next_audio_buffer = 0;
     uint32_t nb_buffers_ready = 0;
-    std::condition_variable buffers_cv;
+    SafeConditionVariable buffers_cv;
 };
 
 struct At9Stream {
@@ -53,7 +54,7 @@ struct At9Stream {
     bool stop_requested;
     PcmData pcm_data;
 
-    std::condition_variable init_cv;
+    SafeConditionVariable init_cv;
     std::mutex mutex;
 };
 

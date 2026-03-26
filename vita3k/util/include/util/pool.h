@@ -23,6 +23,7 @@
 #include <mutex>
 #include <set>
 #include <vector>
+#include <util/safe_condition_variable.h>
 
 template <typename T>
 class PoolItem;
@@ -60,7 +61,7 @@ private:
     }
 
     std::mutex mutex;
-    std::condition_variable cond;
+    SafeConditionVariable cond;
     std::vector<Ptr> items;
     std::set<int> free_ids;
 

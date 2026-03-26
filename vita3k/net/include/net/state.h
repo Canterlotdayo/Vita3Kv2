@@ -27,6 +27,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <util/safe_condition_variable.h>
 
 typedef std::map<int, SocketPtr> NetSockets;
 typedef std::map<int, EpollPtr> NetEpolls;
@@ -51,7 +52,7 @@ struct NetCtlState {
     bool inited = false;
     std::thread adhocThread;
     std::atomic<bool> adhocCondVarReady = false;
-    std::condition_variable adhocCondVar;
+    SafeConditionVariable adhocCondVar;
     SceNetCtlState adhocState = SCE_NET_CTL_STATE_DISCONNECTED;
     SceNetCtlEventType adhocEvent = SCE_NET_CTL_EVENT_TYPE_NONE;
     SceNetCtlEventType lastNotifiedAdhocEvent = SCE_NET_CTL_EVENT_TYPE_NONE;

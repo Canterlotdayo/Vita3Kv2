@@ -24,6 +24,7 @@
 #include <mem/ptr.h>
 
 #include <condition_variable>
+#include <util/safe_condition_variable.h>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -32,7 +33,7 @@
 struct CPUContext;
 
 // Workaround for macOS bug where pthread_cond_wait sporadically returns EINVAL,
-// causing std::condition_variable::wait to throw std::system_error.
+// causing SafeConditionVariable::wait to throw std::system_error.
 // This wrapper catches the exception and retries.
 // See: https://github.com/graphia-app/graphia/issues/33
 struct SafeConditionVariable {
@@ -76,7 +77,7 @@ struct SafeConditionVariable {
     }
 
 private:
-    std::condition_variable cv;
+    SafeConditionVariable cv;
 };
 
 struct ThreadState;

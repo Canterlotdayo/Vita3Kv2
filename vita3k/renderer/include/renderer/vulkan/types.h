@@ -21,6 +21,7 @@
 #include <renderer/types.h>
 #include <shader/uniform_block.h>
 #include <vkutil/objects.h>
+#include <util/safe_condition_variable.h>
 
 struct MemState;
 
@@ -319,7 +320,7 @@ struct VKContext : public renderer::Context {
 
     // only used if memory mapping is enabled
     std::mutex new_frame_mutex;
-    std::condition_variable new_frame_condv;
+    SafeConditionVariable new_frame_condv;
     std::thread gpu_request_wait_thread;
     uint64_t last_frame_waited = 0;
 
