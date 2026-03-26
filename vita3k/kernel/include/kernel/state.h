@@ -139,6 +139,13 @@ struct KernelState {
 
     ObjectStore obj_store;
 
+    // Mono JIT race condition workaround:
+    // Store the address range of mono-vita.suprx code segment so we can detect
+    // when abort() is called from Mono code (due to benign hash table assertion
+    // caused by concurrent JIT compilation on multiple threads).
+    Address mono_code_start = 0;
+    Address mono_code_end = 0;
+
     uint64_t start_tick;
     SceRtcTick base_tick;
     Ptr<SceProcessParam> process_param;

@@ -105,10 +105,118 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X} - ignoring", tname, thread_id, param1, param2);
 
-    // Mono calls abort() when a debug assertion fails (e.g. duplicate JIT hash entry).
-    // These assertions are benign race conditions. Return 0 to let the thread continue.
+    // Mono JIT race condition workaround:
+    // Mono calls abort() when a debug assertion fails in mono_internal_hash_table_insert().
+    // This is a benign race condition: two threads try to JIT-compile the same method and
+    // the second finds the hash slot already occupied. The assertion fires and calls abort().
+    //
+    // We can't just return 0 from abort() because it's __attribute__((noreturn)) - the
+    // compiler didn't emit valid code after the call to abort(). Returning would execute
+    // garbage instructions and crash.
+    //
+    // We can't just kill the thread with exit(0) either, because the JIT compilation work
+    // it was doing never completes, leaving NULL function pointers that cause infinite
+    // invalid-read loops later (the "red circle freeze").
+    //
+    // Solution: walk the ARM frame pointer chain to unwind the stack past the assertion
+    // and the insert function. This returns control to the caller of
+    // mono_internal_hash_table_insert() as if the insert simply returned, which is safe
+    // because the entry already exists in the table (the duplicate is identical).
+    //
+    // Call chain when assertion fires:
+    //   mono code -> mono_internal_hash_table_insert() -> g_assertion_message_expr()
+    //     -> abort() [SceLibc] -> sceKernelCallAbortHandler [we are here]
+
+    bool is_mono_abort = false;
+    if (thread && emuenv.kernel.mono_code_start != 0) {
+        std::string thread_name(tname);
+        if (thread_name.find("Mono") != std::string::npos
+            || thread_name.find("mono") != std::string::npos
+            || thread_name.find("MONO") != std::string::npos) {
+            is_mono_abort = true;
+        }
+    }
+
+    if (is_mono_abort && thread && thread->cpu) {
+        LOG_WARN("Mono abort handler: thread {} (ID: {}), params: 0x{:X}, 0x{:X} - attempting stack unwind",
+                 tname, thread_id, param1, param2);
+
+        // Walk the ARM frame pointer chain.
+        // ARM calling convention with frame pointer:
+        //   prologue: push {r4-rN, r11, lr}; add r11, sp, #offset
+        //   [r11+0] = saved r11 (previous frame pointer)
+        //   [r11+4] = saved lr  (return address)
+        //
+        // We unwind until we find a return address pointing into the Mono code segment.
+        // That frame is mono_internal_hash_table_insert() or its immediate caller.
+        // We then go one more frame up to skip the insert entirely.
+
+        uint32_t fp = read_reg(*thread->cpu, 11); // r11 = frame pointer
+        uint32_t target_pc = 0;
+        uint32_t target_sp = 0;
+        uint32_t target_fp = 0;
+
+        for (int i = 0; i < 8; i++) {
+            if (fp == 0 || fp < emuenv.mem.page_size)
+                break;
+
+            Ptr<uint32_t> fp_ptr(fp);
+            if (!fp_ptr.valid(emuenv.mem))
+                break;
+
+            uint32_t saved_fp = *Ptr<uint32_t>(fp).get(emuenv.mem);
+            uint32_t saved_lr = *Ptr<uint32_t>(fp + 4).get(emuenv.mem);
+
+            LOG_DEBUG("  Frame {}: fp=0x{:08X}, saved_fp=0x{:08X}, saved_lr=0x{:08X}", i, fp, saved_fp, saved_lr);
+
+            // Look for the first frame whose return address points into Mono code.
+            // This is the frame that called into the assertion/abort chain.
+            if (saved_lr >= emuenv.kernel.mono_code_start && saved_lr < emuenv.kernel.mono_code_end) {
+                // Go one MORE frame up to skip mono_internal_hash_table_insert itself
+                if (saved_fp != 0 && saved_fp >= emuenv.mem.page_size) {
+                    Ptr<uint32_t> next_fp_ptr(saved_fp);
+                    if (next_fp_ptr.valid(emuenv.mem)) {
+                        uint32_t next_saved_fp = *Ptr<uint32_t>(saved_fp).get(emuenv.mem);
+                        uint32_t next_saved_lr = *Ptr<uint32_t>(saved_fp + 4).get(emuenv.mem);
+                        target_pc = next_saved_lr;
+                        target_sp = saved_fp + 8;
+                        target_fp = next_saved_fp;
+                        LOG_DEBUG("  Target (skip insert): PC=0x{:08X}, SP=0x{:08X}, FP=0x{:08X}",
+                                  target_pc, target_sp, target_fp);
+                    }
+                }
+                // Fallback: return to this frame if we can't go one more up
+                if (target_pc == 0) {
+                    target_pc = saved_lr;
+                    target_sp = fp + 8;
+                    target_fp = saved_fp;
+                }
+                break;
+            }
+            fp = saved_fp;
+        }
+
+        if (target_pc != 0 && target_pc > emuenv.mem.page_size) {
+            LOG_WARN("Mono abort handler: unwinding to PC=0x{:08X}, SP=0x{:08X}, FP=0x{:08X}",
+                     target_pc, target_sp, target_fp);
+            write_pc(*thread->cpu, target_pc);
+            write_sp(*thread->cpu, target_sp);
+            write_reg(*thread->cpu, 11, target_fp);
+            write_reg(*thread->cpu, 0, 0); // return value = 0 (success)
+            return 0;
+        }
+
+        // Stack unwind failed - fall through to kill the thread as last resort
+        LOG_ERROR("Mono abort handler: stack unwind failed for thread {} (ID: {}), killing thread",
+                  tname, thread_id);
+        thread->exit(0);
+        return 0;
+    }
+
+    // Non-Mono abort: log and return 0 (best effort)
+    LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
+             tname, thread_id, param1, param2);
     return 0;
 }
 

@@ -1109,14 +1109,12 @@ EXPORT(int, sceKernelCallModuleExit) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - returning without killing thread", tname, thread_id);
+    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - terminating thread", tname, thread_id);
 
-    // After abort() calls sceKernelCallAbortHandler then sceKernelCallModuleExit,
-    // we return 0 from both. This causes abort() to return to its caller
-    // (mono_assertion_message -> g_assert), which then continues execution.
-    // The Mono hash table assertion is a benign race condition - the duplicate
-    // entry is harmless. Combined with the MemoryReadCode null pointer fix,
-    // any null function pointers encountered later are handled gracefully.
+    if (thread) {
+        thread->exit(0);
+    }
+
     return 0;
 }
 

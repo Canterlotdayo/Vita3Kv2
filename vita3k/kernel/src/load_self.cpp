@@ -756,6 +756,22 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
     if (!load_imports(*module_info, module_info_segment_address, segment_reloc_info, kernel, mem)) {
         return -1;
     }
+
+    // Mono JIT race condition workaround:
+    // After loading mono-vita.suprx, record its code segment address range.
+    // This is used by sceKernelCallAbortHandler to detect when abort() is called
+    // from Mono code due to a benign hash table assertion (concurrent JIT compilation
+    // of the same method by multiple threads - a race condition that doesn't occur on
+    // real Vita hardware due to fewer cores and different scheduling).
+    if (self_path.find("mono-vita") != std::string::npos) {
+        if (segment_reloc_info.count(0)) {
+            kernel.mono_code_start = segment_reloc_info[0].addr;
+            kernel.mono_code_end = segment_reloc_info[0].addr + segment_reloc_info[0].size;
+            LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
+                     kernel.mono_code_start, kernel.mono_code_end);
+        }
+    }
+
     const SceUID uid = kernel.get_next_uid();
     sceKernelModuleInfo->modid = uid;
     {
