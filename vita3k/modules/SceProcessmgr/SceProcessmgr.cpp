@@ -108,10 +108,13 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // abort() is __noreturn - we cannot safely return from it.
-    // Kill the thread to prevent executing undefined code after abort().
+    // abort() is __noreturn - we cannot safely return from this function because
+    // the compiler didn't emit valid code after the call to abort().
+    // We must actually terminate the thread. exit(0) only sets flags and the thread
+    // would continue executing garbage instructions after we return.
+    // exit_delete(false) properly removes the thread from the scheduler.
     if (thread) {
-        thread->exit(0);
+        thread->exit_delete(false);
     }
     return 0;
 }
