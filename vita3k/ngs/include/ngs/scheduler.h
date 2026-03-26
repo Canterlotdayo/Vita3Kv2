@@ -61,7 +61,7 @@ struct VoiceScheduler {
     std::queue<OperationPending> operations_pending;
 
     std::recursive_mutex mutex;
-    SafeConditionVariable_any condvar;
+    std::condition_variable_any condvar;
     bool is_updating = false;
 
 protected:
