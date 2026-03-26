@@ -20,6 +20,7 @@
 #include "../SceKernelThreadMgr/SceThreadmgr.h"
 #include <cpu/functions.h>
 #include <kernel/state.h>
+#include <kernel/sync_primitives.h>
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceKernelForMono);
 
@@ -48,21 +49,25 @@ EXPORT(int, sceKernelWaitExceptionForMono) {
 
     LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
 
-    // Register this thread as the Mono exception handler thread.
-    // When a null pointer fault is detected in MemoryReadCode, the faulting thread
-    // will be suspended and this thread will be resumed with the fault info.
+    // Create a semaphore if we don't have one yet, then wait on it.
+    // This properly blocks the guest thread within the kernel threading model.
+    // When a null pointer fault is detected, signal_mono_exception() will
+    // signal this semaphore to wake us up.
     {
         std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
         emuenv.kernel.mono_exception_handler_thread = thread_id;
+
+        if (emuenv.kernel.mono_exception_sema == 0) {
+            emuenv.kernel.mono_exception_sema = semaphore_create(emuenv.kernel, export_name,
+                "MonoExceptionSema", thread_id, 0, 0, 1);
+            LOG_INFO("Created Mono exception semaphore: {}", emuenv.kernel.mono_exception_sema);
+        }
     }
 
-    // Suspend this guest thread using the normal guest thread mechanism.
-    // It will be woken up by signal_mono_exception() calling resume() on us.
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    if (!thread)
-        return -1;
-
-    thread->suspend();
+    // Block on the semaphore - this is a proper guest-level wait that suspends
+    // the thread correctly within the run_loop mechanism.
+    SceUID sema = emuenv.kernel.mono_exception_sema;
+    semaphore_wait(emuenv.kernel, export_name, thread_id, sema, 1, nullptr);
 
     // When we wake up, the exception info is in KernelState
     std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);

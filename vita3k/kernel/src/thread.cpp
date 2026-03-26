@@ -413,10 +413,10 @@ Address ThreadState::stack_top() const {
 }
 
 void ThreadState::suspend() {
-    // Allow suspend on already-suspended threads (e.g., when Mono exception handler
-    // calls SuspendThreadForMono on a thread we already suspended in signal_mono_exception)
-    if (to_do != ThreadToDo::run)
+    if (to_do != ThreadToDo::run) {
+        // Thread already suspended (e.g., by signal_mono_exception before Mono calls SuspendThreadForMono)
         return;
+    }
     to_do = ThreadToDo::suspend;
     stop(*cpu);
 }

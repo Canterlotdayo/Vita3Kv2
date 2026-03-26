@@ -158,7 +158,8 @@ struct KernelState {
     // and suspend the faulting thread until Mono processes the exception.
     std::mutex mono_exception_mutex;
     bool mono_exception_pending = false;
-    SceUID mono_exception_handler_thread = 0;  // thread ID of ExceptionHandlerThread (waiting in WaitExceptionForMono)
+    SceUID mono_exception_handler_thread = 0;  // thread ID of ExceptionHandlerThread
+    SceUID mono_exception_sema = 0;            // semaphore to block ExceptionHandlerThread
     SceUID mono_exception_thread_id = 0;       // faulting thread ID
     Address mono_exception_fault_addr = 0;     // address that caused the fault
     Address mono_exception_fault_pc = 0;       // PC at time of fault

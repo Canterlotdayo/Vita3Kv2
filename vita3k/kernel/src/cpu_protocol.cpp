@@ -19,6 +19,7 @@
 
 #include <cpu/functions.h>
 #include <kernel/state.h>
+#include <kernel/sync_primitives.h>
 
 CPUProtocol::CPUProtocol(KernelState &kernel, MemState &mem, const CallImportFunc &func)
     : call_import(func)
@@ -72,19 +73,20 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
     if (kernel->mono_code_start == 0)
         return false;
 
-    SceUID handler_tid = 0;
+    SceUID sema = 0;
     {
         std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
 
         // Only signal if no exception is already pending and handler is registered
-        if (kernel->mono_exception_pending || kernel->mono_exception_handler_thread == 0)
+        if (kernel->mono_exception_pending || kernel->mono_exception_handler_thread == 0
+            || kernel->mono_exception_sema == 0)
             return false;
 
         kernel->mono_exception_pending = true;
         kernel->mono_exception_thread_id = thread_id;
         kernel->mono_exception_fault_addr = fault_addr;
         kernel->mono_exception_fault_pc = fault_pc;
-        handler_tid = kernel->mono_exception_handler_thread;
+        sema = kernel->mono_exception_sema;
     }
 
     // Suspend the faulting thread
@@ -93,11 +95,8 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
         faulting_thread->suspend();
     }
 
-    // Wake up the ExceptionHandlerThread (which is suspended in WaitExceptionForMono)
-    auto handler_thread = kernel->get_thread(handler_tid);
-    if (handler_thread) {
-        handler_thread->resume();
-    }
+    // Wake up the ExceptionHandlerThread by signaling the semaphore
+    semaphore_signal(*kernel, "signal_mono_exception", thread_id, sema, 1);
 
     return true;
 }
