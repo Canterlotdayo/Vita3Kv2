@@ -106,6 +106,24 @@ public:
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr addr) override {
         if (cpu->log_mem)
             LOG_TRACE("Instruction fetch at address 0x{:X}", addr);
+
+        // Handle null function pointer calls: when PC=0 (or in first page),
+        // the game called through a null pointer. Instead of spinning on invalid
+        // instructions, redirect execution back to the caller (LR) so the thread
+        // can continue. This is equivalent to the null function returning 0.
+        if (addr < parent->mem->page_size) {
+            auto lr = cpu->get_lr();
+            LOG_WARN("Null function pointer call detected (PC=0x{:X}, LR=0x{:X}) - returning to caller", addr, lr);
+            // Set return value to 0
+            cpu->jit->Regs()[0] = 0;
+            // Set PC to LR to return to caller
+            cpu->set_pc(lr);
+            // Halt current execution so run_loop picks up the new PC
+            cpu->jit->HaltExecution();
+            // Return a NOP instruction so Dynarmic doesn't crash
+            return 0xE320F000; // ARM NOP
+        }
+
         return MemoryRead32(addr);
     }
 
