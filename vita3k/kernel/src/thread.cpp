@@ -272,12 +272,6 @@ bool ThreadState::run_loop() {
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
-
-                // Yield after each quantum to give other threads a chance.
-                // This emulates the real Vita's preemptive scheduling.
-                if (to_do == ThreadToDo::run && res == 0)
-                    std::this_thread::yield();
-
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
 
             lock.lock();

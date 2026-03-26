@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 
 class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
     uint32_t tpidruro;
@@ -302,6 +303,17 @@ public:
         if (cpu->log_mem) {
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
         }
+
+        // If the exclusive write failed (STREX returned failure), yield to let
+        // the thread holding the spinlock make progress. On real Vita hardware,
+        // threads on the same core are time-sliced by the kernel, so a spinning
+        // thread would eventually be preempted. In Vita3K, threads run on separate
+        // host threads with true parallelism, so without this yield, a spin-loop
+        // can starve the lock holder and cause deadlock-like behavior.
+        if (!result) {
+            std::this_thread::yield();
+        }
+
         return result;
     }
 
@@ -375,24 +387,10 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {
-        ticks_remaining -= ticks;
-    }
+    void AddTicks(uint64_t ticks) override {}
 
     uint64_t GetTicksRemaining() override {
-        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
-    }
-
-    // Time quantum in ticks. When exhausted, Dynarmic returns from run()
-    // giving other threads a chance to execute. This emulates the real Vita's
-    // preemptive scheduling where threads on the same core are time-sliced.
-    // Without this, threads run until an SVC, causing race conditions in
-    // guest code that assumes cooperative scheduling (e.g., Mono class init).
-    static constexpr int64_t TICKS_QUANTUM = 1024;
-    int64_t ticks_remaining = TICKS_QUANTUM;
-
-    void reset_ticks() {
-        ticks_remaining = TICKS_QUANTUM;
+        return 1ull << 60;
     }
 };
 
@@ -407,7 +405,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    config.enable_cycle_counting = true;
+    config.enable_cycle_counting = false;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
@@ -434,11 +432,6 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     Dynarmic::HaltReason halt_reason;
-
-    // Reset the tick quantum before each run.
-    // GetTicksRemaining() returns the remaining ticks, and Dynarmic stops
-    // when they reach 0. This gives preemptive-style time slicing.
-    cb->reset_ticks();
 
     do {
         halt_reason = jit->Run();
