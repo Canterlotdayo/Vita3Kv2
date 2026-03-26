@@ -18,6 +18,7 @@
 #include "SceProcessmgr.h"
 
 #include <io/functions.h>
+#include <cpu/functions.h>
 #include <kernel/state.h>
 #include <rtc/rtc.h>
 
@@ -101,7 +102,22 @@ EXPORT(int, sceKernelCDialogSetLeaseLimit) {
 
 EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     TRACY_FUNC(sceKernelCallAbortHandler, param1, param2);
-    return UNIMPLEMENTED();
+
+    // Dump full thread context for crash diagnosis
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    const char *tname = thread ? thread->name.c_str() : "unknown";
+    LOG_ERROR("=== ABORT HANDLER CALLED ===");
+    LOG_ERROR("  Thread: {} (ID: {})", tname, thread_id);
+    LOG_ERROR("  Params: 0x{:X}, 0x{:X}", param1, param2);
+    if (thread && thread->cpu) {
+        auto ctx = thread->cpu->save_context();
+        LOG_ERROR("  CPU context:\n{}", ctx.description());
+    }
+    LOG_ERROR("============================");
+
+    // On a real Vita this calls the registered abort handler then terminates.
+    // Returning 0 allows the runtime to attempt recovery rather than hanging.
+    return 0;
 }
 
 EXPORT(int, sceKernelGetCurrentProcess) {

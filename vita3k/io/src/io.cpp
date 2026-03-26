@@ -402,7 +402,7 @@ int write_file(SceUID fd, const void *data, const SceSize size, const IOState &i
             } else {
                 if (s.back() == '\n')
                     s.pop_back();
-                LOG_TRACE_IF(log_file_op, "*** TTY: {}", s);
+                LOG_WARN("*** TTY: {}", s);
             }
 
             return size;

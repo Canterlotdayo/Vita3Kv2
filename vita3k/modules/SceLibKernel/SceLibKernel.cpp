@@ -1106,7 +1106,24 @@ EXPORT(int, sceKernelBacktraceSelf) {
 
 EXPORT(int, sceKernelCallModuleExit) {
     TRACY_FUNC(sceKernelCallModuleExit);
-    return UNIMPLEMENTED();
+
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    const char *tname = thread ? thread->name.c_str() : "unknown";
+    LOG_INFO("=== MODULE EXIT CALLED ===");
+    LOG_INFO("  Thread: {} (ID: {})", tname, thread_id);
+    if (thread && thread->cpu) {
+        auto ctx = thread->cpu->save_context();
+        LOG_INFO("  CPU context:\n{}", ctx.description());
+    }
+    LOG_INFO("==========================");
+
+    // This function is called when a module wants to invoke its stop entry and unload.
+    // The minimal correct behavior is to terminate the calling thread.
+    if (thread) {
+        thread->exit_delete();
+    }
+
+    return 0;
 }
 
 EXPORT(int, sceKernelCallWithChangeStack) {
