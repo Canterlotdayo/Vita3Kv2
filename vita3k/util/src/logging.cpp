@@ -31,6 +31,7 @@
 #endif
 
 #include <iostream>
+#include <system_error>
 #include <vector>
 
 namespace logging {
@@ -79,6 +80,16 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
     old_terminate = std::set_terminate([]() {
         try {
             std::rethrow_exception(std::current_exception());
+        } catch (const std::system_error &e) {
+            // macOS bug: pthread_cond_wait sporadically returns EINVAL,
+            // causing condition_variable::wait to throw. Log and survive.
+            // See: https://github.com/graphia-app/graphia/issues/33
+            std::string what = e.what();
+            if (what.find("condition_variable") != std::string::npos) {
+                LOG_WARN("macOS condition_variable bug caught in terminate handler: {}", what);
+                return; // Do NOT terminate — this is a known macOS bug
+            }
+            LOG_CRITICAL("Unhandled C++ exception. {}", e.what());
         } catch (const std::exception &e) {
             LOG_CRITICAL("Unhandled C++ exception. {}", e.what());
         } catch (...) {

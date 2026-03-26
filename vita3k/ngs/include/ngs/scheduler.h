@@ -23,6 +23,7 @@
 
 #include <condition_variable>
 #include <queue>
+#include <util/safe_condition_variable.h>
 #include <vector>
 
 struct MemState;
@@ -61,7 +62,7 @@ struct VoiceScheduler {
     std::queue<OperationPending> operations_pending;
 
     std::recursive_mutex mutex;
-    std::condition_variable_any condvar;
+    SafeConditionVariable_any condvar;
     bool is_updating = false;
 
 protected:

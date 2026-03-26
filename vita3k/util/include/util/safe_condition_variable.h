@@ -51,3 +51,48 @@ struct SafeConditionVariable {
 private:
     std::condition_variable cv;
 };
+
+// Same wrapper for condition_variable_any
+struct SafeConditionVariable_any {
+    void notify_one() noexcept { cv.notify_one(); }
+    void notify_all() noexcept { cv.notify_all(); }
+
+    template <typename Lock>
+    void wait(Lock &lock) {
+        while (true) {
+            try {
+                cv.wait(lock);
+                return;
+            } catch (const std::system_error &) {
+            }
+        }
+    }
+
+    template <typename Lock, typename Predicate>
+    void wait(Lock &lock, Predicate pred) {
+        while (!pred()) {
+            wait(lock);
+        }
+    }
+
+    template <typename Lock, typename Rep, typename Period>
+    std::cv_status wait_for(Lock &lock, const std::chrono::duration<Rep, Period> &rel_time) {
+        try {
+            return cv.wait_for(lock, rel_time);
+        } catch (const std::system_error &) {
+            return std::cv_status::no_timeout;
+        }
+    }
+
+    template <typename Lock, typename Rep, typename Period, typename Predicate>
+    bool wait_for(Lock &lock, const std::chrono::duration<Rep, Period> &rel_time, Predicate pred) {
+        try {
+            return cv.wait_for(lock, rel_time, pred);
+        } catch (const std::system_error &) {
+            return pred();
+        }
+    }
+
+private:
+    std::condition_variable_any cv;
+};
