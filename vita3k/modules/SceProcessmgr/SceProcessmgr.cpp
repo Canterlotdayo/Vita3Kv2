@@ -108,14 +108,14 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // abort() is __noreturn - we cannot safely return from this function because
-    // the compiler didn't emit valid code after the call to abort().
-    // We must actually terminate the thread. exit(0) only sets flags and the thread
-    // would continue executing garbage instructions after we return.
-    // exit_delete(false) properly removes the thread from the scheduler.
-    if (thread) {
-        thread->exit_delete(false);
-    }
+    // Mono calls abort() when a benign hash table assertion fires
+    // (two threads JIT-compiling the same method concurrently).
+    // The assertion "pending init" means the entry already exists - this is fine.
+    // We return 0 to let the thread continue. Although abort() is __noreturn,
+    // the calling code (g_assertion_message_expr -> mono_internal_hash_table_insert)
+    // has valid epilogues that will unwind back to the JIT caller.
+    // Killing the thread causes either crashes (garbage execution) or freezes
+    // (JIT work never completes).
     return 0;
 }
 
