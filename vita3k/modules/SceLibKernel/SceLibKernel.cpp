@@ -1117,9 +1117,13 @@ EXPORT(int, sceKernelCallModuleExit) {
     }
     LOG_INFO("==========================");
 
-    // Do NOT call exit_delete() here — this function is called during normal
-    // module lifecycle (e.g. Unity plugin init/shutdown) and killing the thread
-    // causes condition_variable crashes in other threads still running.
+    // Stop the guest CPU execution for this thread.
+    // This makes run_loop() exit cleanly without destroying
+    // host-side objects (avoiding macOS condition_variable crash).
+    if (thread && thread->cpu) {
+        stop(*thread->cpu);
+    }
+
     return 0;
 }
 
