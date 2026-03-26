@@ -283,7 +283,16 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
         // module_start is always called from new thread
         const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_start, priority, affinity, stack_size, nullptr);
 
-        const uint32_t ret = module_thread->run_guest_function(module_start.address(), args, argp.cast<void>());
+        uint32_t ret = 0;
+        try {
+            ret = module_thread->run_guest_function(module_start.address(), args, argp.cast<void>());
+        } catch (const std::system_error &e) {
+            LOG_ERROR("module_start of {} threw system_error: {}", module_name, e.what());
+            ret = SCE_KERNEL_START_SUCCESS; // pretend it succeeded
+        } catch (const std::exception &e) {
+            LOG_ERROR("module_start of {} threw exception: {}", module_name, e.what());
+            ret = SCE_KERNEL_START_SUCCESS;
+        }
         module_thread->exit_delete(false);
 
         LOG_INFO("Module {} (at \"{}\") module_start returned {}", module_name, module.path, log_hex(ret));
