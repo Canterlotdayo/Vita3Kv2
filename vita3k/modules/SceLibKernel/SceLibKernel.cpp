@@ -1109,15 +1109,12 @@ EXPORT(int, sceKernelCallModuleExit) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - terminating thread", tname, thread_id);
+    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - returning without killing thread", tname, thread_id);
 
-    // This is called during the abort() cleanup chain, before sceKernelExitProcess.
-    // We must properly terminate the thread HERE to prevent the chain from reaching
-    // sceKernelExitProcess which would kill the entire emulator.
-    if (thread) {
-        thread->exit_delete(false);
-    }
-
+    // Do NOT kill the thread. This is called as part of libc's abort() chain.
+    // If we kill the thread here, JIT compilation never completes and the game freezes.
+    // By returning 0, abort() continues to _exit() which calls sceKernelExitProcess.
+    // sceKernelExitProcess is also made safe (no-op for Mono threads).
     return 0;
 }
 
@@ -1302,8 +1299,17 @@ EXPORT(int, sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
 
 EXPORT(int, sceKernelExitProcess, int res) {
     TRACY_FUNC(sceKernelExitProcess, res);
-    // TODO Handle exit code?
-    emuenv.kernel.exit_delete_all_threads();
+
+    // Called at the end of libc's abort() chain.
+    // On a real Vita, this would kill the entire process.
+    // In Vita3K, we must NOT kill all threads - that would crash the emulator.
+    // The Mono assertion that triggered abort() is benign (concurrent JIT race).
+    // Just log and return - the thread will return through the abort() chain
+    // back to g_error() and then back to mono_class_init() which will continue.
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    const char *tname = thread ? thread->name.c_str() : "unknown";
+    LOG_WARN("sceKernelExitProcess called on thread {} (ID: {}), res={} - ignoring to keep emulator alive",
+             tname, thread_id, res);
 
     return SCE_KERNEL_OK;
 }

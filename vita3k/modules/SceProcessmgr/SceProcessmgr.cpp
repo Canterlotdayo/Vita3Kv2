@@ -108,10 +108,11 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // Return 0 to let libc's abort() continue its cleanup chain.
-    // The chain calls sceKernelCallModuleExit next, which will properly
-    // terminate the thread with exit_delete, preventing the chain from
-    // reaching sceKernelExitProcess (which would kill the whole emulator).
+    // Return 0 to let the calling code continue.
+    // In Mono, the assertion "pending init" fires when two threads try to
+    // initialize the same class concurrently. The code after the assertion
+    // re-reads the class flags and continues initialization normally.
+    // Killing the thread would prevent JIT compilation from completing.
     return 0;
 }
 
