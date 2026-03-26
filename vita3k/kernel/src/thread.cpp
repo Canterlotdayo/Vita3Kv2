@@ -29,29 +29,9 @@
 #include <memory>
 #include <sstream>
 
-// Workaround for macOS bug where pthread_cond_wait sporadically returns EINVAL,
-// causing std::condition_variable::wait to throw std::system_error.
-// See: https://github.com/graphia-app/graphia/issues/33
-template <typename Lock>
-static void safe_cv_wait(std::condition_variable &cv, Lock &lock) {
-    try {
-        cv.wait(lock);
-    } catch (const std::system_error &e) {
-        LOG_WARN("condition_variable::wait threw ({}), retrying...", e.what());
-        // just return and let the caller re-check its predicate and loop back
-    }
-}
-
-template <typename Lock, typename Predicate>
-static void safe_cv_wait(std::condition_variable &cv, Lock &lock, Predicate pred) {
-    while (!pred()) {
-        safe_cv_wait(cv, lock);
-    }
-}
-
 void ThreadSignal::wait() {
     std::unique_lock<std::mutex> lock(mutex);
-    safe_cv_wait(recv_cond, lock, [&]() { return signaled; });
+    recv_cond.wait(lock, [&]() { return signaled; });
     signaled = false;
 }
 
@@ -326,11 +306,11 @@ bool ThreadState::run_loop() {
             }
             break;
         case ThreadToDo::wait:
-            safe_cv_wait(something_to_do, lock);
+            something_to_do.wait(lock);
             break;
         case ThreadToDo::suspend:
             update_status(ThreadStatus::suspend);
-            safe_cv_wait(something_to_do, lock);
+            something_to_do.wait(lock);
             break;
         }
     }
@@ -394,7 +374,7 @@ uint32_t ThreadState::run_guest_function(Address callback_address, SceSize args,
         // wait for the function to return
         std::unique_lock<std::mutex> lock(mutex);
         if (status != ThreadStatus::dormant || to_do == ThreadToDo::run) {
-            safe_cv_wait(status_cond, lock, [&]() {
+            status_cond.wait(lock, [&]() {
                 return status == ThreadStatus::dormant && to_do != ThreadToDo::run;
             });
         }

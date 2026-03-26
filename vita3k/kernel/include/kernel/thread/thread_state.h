@@ -27,8 +27,57 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 
 struct CPUContext;
+
+// Workaround for macOS bug where pthread_cond_wait sporadically returns EINVAL,
+// causing std::condition_variable::wait to throw std::system_error.
+// This wrapper catches the exception and retries.
+// See: https://github.com/graphia-app/graphia/issues/33
+struct SafeConditionVariable {
+    void notify_one() noexcept { cv.notify_one(); }
+    void notify_all() noexcept { cv.notify_all(); }
+
+    void wait(std::unique_lock<std::mutex> &lock) {
+        while (true) {
+            try {
+                cv.wait(lock);
+                return;
+            } catch (const std::system_error &) {
+                // macOS EINVAL spurious failure — retry
+            }
+        }
+    }
+
+    template <typename Predicate>
+    void wait(std::unique_lock<std::mutex> &lock, Predicate pred) {
+        while (!pred()) {
+            wait(lock);
+        }
+    }
+
+    template <typename Rep, typename Period>
+    std::cv_status wait_for(std::unique_lock<std::mutex> &lock, const std::chrono::duration<Rep, Period> &rel_time) {
+        try {
+            return cv.wait_for(lock, rel_time);
+        } catch (const std::system_error &) {
+            return std::cv_status::no_timeout;
+        }
+    }
+
+    template <typename Rep, typename Period, typename Predicate>
+    bool wait_for(std::unique_lock<std::mutex> &lock, const std::chrono::duration<Rep, Period> &rel_time, Predicate pred) {
+        try {
+            return cv.wait_for(lock, rel_time, pred);
+        } catch (const std::system_error &) {
+            return pred();
+        }
+    }
+
+private:
+    std::condition_variable cv;
+};
 
 struct ThreadState;
 struct ThreadParams;
@@ -54,7 +103,7 @@ struct ThreadSignal {
 
 private:
     std::mutex mutex;
-    std::condition_variable recv_cond;
+    SafeConditionVariable recv_cond;
     bool signaled = false;
 };
 
@@ -89,7 +138,7 @@ struct ThreadState {
 
     ThreadSignal signal;
     std::vector<CallbackPtr> callbacks;
-    std::condition_variable status_cond;
+    SafeConditionVariable status_cond;
     std::vector<std::shared_ptr<ThreadState>> waiting_threads;
     uint32_t returned_value = 0;
 
@@ -126,7 +175,7 @@ private:
 
     CPUContext init_cpu_ctx;
     ThreadToDo to_do = ThreadToDo::wait;
-    std::condition_variable something_to_do;
+    SafeConditionVariable something_to_do;
 
     // if looking at the thread stack, the number of times run_loop appear
     // if the thread is dormant, call_level is 0
