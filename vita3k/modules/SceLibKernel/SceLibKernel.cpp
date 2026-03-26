@@ -1109,13 +1109,16 @@ EXPORT(int, sceKernelCallModuleExit) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("sceKernelCallModuleExit called on thread {} (ID: {}) - ignoring to allow Mono to continue", tname, thread_id);
+    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - terminating thread", tname, thread_id);
 
-    // On a real Vita, abort() -> sceKernelCallAbortHandler -> sceKernelCallModuleExit
-    // terminates the process. But Mono's assertions are debug checks for race conditions
-    // that are benign (duplicate JIT hash table entries). 
-    // By returning 0 without stopping the thread, the Mono assertion handler returns
-    // to its caller, which continues execution normally.
+    // Mono calls abort() -> sceKernelCallAbortHandler -> sceKernelCallModuleExit
+    // when an assertion fails. The thread's internal state is corrupted and cannot
+    // continue. We must terminate this specific thread to prevent it from executing
+    // garbage instructions. Other threads continue normally.
+    if (thread) {
+        thread->exit(0);
+    }
+
     return 0;
 }
 
