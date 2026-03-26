@@ -261,22 +261,6 @@ bool ThreadState::run_loop() {
 
             // Run the cpu
             do {
-                // Lock the core mutex to serialize threads on the same CPU core.
-                // This prevents race conditions in guest code that assumes
-                // single-core cooperative scheduling (like Mono's class init).
-                int core_idx;
-                if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT) {
-                    // Default affinity: distribute across cores by thread ID
-                    core_idx = id % KernelState::NUM_CORES;
-                } else if (affinity_mask & 0x10000) {
-                    core_idx = 0;
-                } else if (affinity_mask & 0x20000) {
-                    core_idx = 1;
-                } else {
-                    core_idx = 2;
-                }
-                kernel.core_mutex[core_idx].lock();
-
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
@@ -284,12 +268,16 @@ bool ThreadState::run_loop() {
                 } else
                     res = run(*cpu);
 
-                kernel.core_mutex[core_idx].unlock();
-
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
+
+                // Yield after each quantum to give other threads a chance.
+                // This emulates the real Vita's preemptive scheduling.
+                if (to_do == ThreadToDo::run && res == 0)
+                    std::this_thread::yield();
+
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
 
             lock.lock();
