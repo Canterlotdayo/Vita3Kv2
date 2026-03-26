@@ -1111,8 +1111,11 @@ EXPORT(int, sceKernelCallModuleExit) {
     const char *tname = thread ? thread->name.c_str() : "unknown";
     LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - terminating thread", tname, thread_id);
 
+    // This is called during the abort() cleanup chain, before sceKernelExitProcess.
+    // We must properly terminate the thread HERE to prevent the chain from reaching
+    // sceKernelExitProcess which would kill the entire emulator.
     if (thread) {
-        thread->exit(0);
+        thread->exit_delete(false);
     }
 
     return 0;

@@ -108,14 +108,10 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // Mono calls abort() when a benign hash table assertion fires
-    // (two threads JIT-compiling the same method concurrently).
-    // The assertion "pending init" means the entry already exists - this is fine.
-    // We return 0 to let the thread continue. Although abort() is __noreturn,
-    // the calling code (g_assertion_message_expr -> mono_internal_hash_table_insert)
-    // has valid epilogues that will unwind back to the JIT caller.
-    // Killing the thread causes either crashes (garbage execution) or freezes
-    // (JIT work never completes).
+    // Return 0 to let libc's abort() continue its cleanup chain.
+    // The chain calls sceKernelCallModuleExit next, which will properly
+    // terminate the thread with exit_delete, preventing the chain from
+    // reaching sceKernelExitProcess (which would kill the whole emulator).
     return 0;
 }
 
