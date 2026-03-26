@@ -43,13 +43,6 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
     return CALL_EXPORT(sceKernelSuspendThreadForVM, threadId);
 }
 
-EXPORT(int, sceKernelWaitExceptionCBForMono) {
-    TRACY_FUNC(sceKernelWaitExceptionCBForMono);
-    // Same as WaitExceptionForMono but with callback processing
-    // For now, delegate to the non-CB version
-    return CALL_EXPORT(sceKernelWaitExceptionForMono);
-}
-
 EXPORT(int, sceKernelWaitExceptionForMono) {
     TRACY_FUNC(sceKernelWaitExceptionForMono);
 
@@ -90,4 +83,9 @@ EXPORT(int, sceKernelWaitExceptionForMono) {
     // but the thread ID is the essential piece Mono needs to call
     // SuspendThreadForMono/GetThreadContextForMono etc.
     return faulting_tid;
+}
+
+EXPORT(int, sceKernelWaitExceptionCBForMono) {
+    TRACY_FUNC(sceKernelWaitExceptionCBForMono);
+    return CALL_EXPORT(sceKernelWaitExceptionForMono);
 }
