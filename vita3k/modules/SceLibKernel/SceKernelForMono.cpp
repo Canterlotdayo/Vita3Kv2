@@ -15,301 +15,77 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-#include "SceProcessmgr.h"
+#include <module/module.h>
 
-#include <io/functions.h>
+#include "../SceKernelThreadMgr/SceThreadmgr.h"
 #include <cpu/functions.h>
 #include <kernel/state.h>
-#include <rtc/rtc.h>
-
-#include <util/safe_time.h>
-
 #include <util/tracy.h>
-TRACY_MODULE_NAME(SceProcessmgr);
+TRACY_MODULE_NAME(SceKernelForMono);
 
-template <>
-std::string to_debug_str<SceKernelPowerTickType>(const MemState &mem, SceKernelPowerTickType type) {
-    switch (type) {
-    case SCE_KERNEL_POWER_TICK_DEFAULT: return "SCE_KERNEL_POWER_TICK_DEFAULT";
-    case SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND: return "SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND";
-    case SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF: return "SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF";
-    case SCE_KERNEL_POWER_TICK_DISABLE_OLED_DIMMING: return "SCE_KERNEL_POWER_TICK_DISABLE_OLED_DIMMING";
-    }
-    return std::to_string(type);
+EXPORT(int, sceKernelGetThreadContextForMono, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo, Ptr<SceKernelThreadVfpRegisterInfo> pVfpRegisterInfo) {
+    TRACY_FUNC(sceKernelGetThreadContextForMono, threadId, pCpuRegisterInfo, pVfpRegisterInfo);
+    return CALL_EXPORT(_sceKernelGetThreadContextForVM, threadId, pCpuRegisterInfo, pVfpRegisterInfo);
 }
 
-struct VitaTimeval {
-    uint32_t tv_sec;
-    uint32_t tv_usec;
-};
-struct VitaTimezone {
-    int tz_minuteswest;
-    int tz_dsttime;
-};
-
-using VitaTime = uint32_t;
-struct VitaTM {
-    int tm_sec;
-    int tm_min;
-    int tm_hour;
-    int tm_mday;
-    int tm_mon;
-    int tm_year;
-    int tm_wday;
-    int tm_yday;
-    int tm_isdst;
-};
-
-static_assert(sizeof(VitaTM) == 36);
-static_assert(sizeof(VitaTM) <= sizeof(struct tm));
-
-struct SceLibkernelAddresses {
-    uint32_t size;
-    Ptr<void> sceKernelExitThread;
-    Ptr<void> sceKernelExitDeleteThread;
-    Ptr<void> _sceKernelExitCallback;
-    Ptr<void> field_0x10;
-    Ptr<void> field_0x14;
-    Ptr<void> field_0x18;
-};
-
-EXPORT(int, _sceKernelExitProcessForUser) {
-    TRACY_FUNC(_sceKernelExitProcessForUser);
-    return UNIMPLEMENTED();
+EXPORT(int, sceKernelResumeThreadForMono, SceUID threadId) {
+    TRACY_FUNC(sceKernelResumeThreadForMono, threadId);
+    return CALL_EXPORT(sceKernelResumeThreadForVM, threadId);
 }
 
-EXPORT(int, _sceKernelGetTimer5Reg, Ptr<uint64_t> *timer) {
-    TRACY_FUNC(_sceKernelGetTimer5Reg, timer);
-    *timer = alloc<uint64_t>(emuenv.mem, "timer5reg");
-    *(*timer).get(emuenv.mem) = rtc_get_ticks(emuenv.kernel.base_tick.tick);
-    return SCE_KERNEL_OK;
+EXPORT(int, sceKernelSetThreadContextForMono, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo, Ptr<SceKernelThreadVfpRegisterInfo> pVfpRegisterInfo) {
+    TRACY_FUNC(sceKernelSetThreadContextForMono, threadId, pCpuRegisterInfo, pVfpRegisterInfo);
+    return CALL_EXPORT(_sceKernelSetThreadContextForVM, threadId, pCpuRegisterInfo, pVfpRegisterInfo);
 }
 
-EXPORT(int, _sceKernelRegisterLibkernelAddresses, SceLibkernelAddresses *addresses) {
-    TRACY_FUNC(_sceKernelRegisterLibkernelAddresses, addresses);
-    return UNIMPLEMENTED();
+EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
+    TRACY_FUNC(sceKernelSuspendThreadForMono, threadId);
+    return CALL_EXPORT(sceKernelSuspendThreadForVM, threadId);
 }
 
-EXPORT(int, sceKernelCDialogSessionClose) {
-    TRACY_FUNC(sceKernelCDialogSessionClose);
-    return UNIMPLEMENTED();
+EXPORT(int, sceKernelWaitExceptionForMono) {
+    TRACY_FUNC(sceKernelWaitExceptionForMono);
+
+    // On real Vita, this function blocks until another thread triggers a
+    // hardware exception (null pointer dereference, illegal instruction, etc.).
+    // The kernel then wakes this thread with info about the faulting thread.
+    // Mono uses this to implement C# exception handling:
+    // 1. This function returns the faulting thread ID
+    // 2. Mono suspends the faulting thread
+    // 3. Mono reads the faulting thread's CPU context
+    // 4. Mono modifies PC to point to the C# exception handler
+    // 5. Mono resumes the faulting thread
+    //
+    // In Vita3K, Dynarmic detects null accesses in MemoryReadCode/MemoryRead
+    // and signals us via the mono_exception_* fields in KernelState.
+
+    LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
+
+    // Wait on the condition variable until an exception is signaled
+    std::unique_lock<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+    emuenv.kernel.mono_exception_cond.wait(lock, [&] {
+        return emuenv.kernel.mono_exception_pending;
+    });
+
+    // Exception received
+    SceUID faulting_tid = emuenv.kernel.mono_exception_thread_id;
+    Address fault_addr = emuenv.kernel.mono_exception_fault_addr;
+    Address fault_pc = emuenv.kernel.mono_exception_fault_pc;
+    emuenv.kernel.mono_exception_pending = false;
+
+    lock.unlock();
+
+    LOG_WARN("sceKernelWaitExceptionForMono: exception received! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
+             faulting_tid, fault_addr, fault_pc);
+
+    // Return the faulting thread ID
+    // On real Vita, the return value format may be more complex,
+    // but the thread ID is the essential piece Mono needs to call
+    // SuspendThreadForMono/GetThreadContextForMono etc.
+    return faulting_tid;
 }
 
-EXPORT(int, sceKernelCDialogSetLeaseLimit) {
-    TRACY_FUNC(sceKernelCDialogSetLeaseLimit);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
-    TRACY_FUNC(sceKernelCallAbortHandler, param1, param2);
-
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
-             tname, thread_id, param1, param2);
-
-    // abort() is __noreturn - we cannot safely return from it.
-    // Kill the thread to prevent executing undefined code after abort().
-    if (thread) {
-        thread->exit(0);
-    }
-    return 0;
-}
-
-EXPORT(int, sceKernelGetCurrentProcess) {
-    TRACY_FUNC(sceKernelGetCurrentProcess);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetExtraTty) {
-    TRACY_FUNC(sceKernelGetExtraTty);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetProcessName, char *process_name, uint32_t len) {
-    TRACY_FUNC(sceKernelGetProcessName, process_name, len);
-    if (!process_name || len > 32 || len == 0)
-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    strncpy(process_name, emuenv.kernel.process_param.get(emuenv.mem)->process_name.get(emuenv.mem), len);
-    return 0;
-}
-
-EXPORT(Ptr<SceProcessParam>, sceKernelGetProcessParam, void *args) {
-    TRACY_FUNC(sceKernelGetProcessParam, args);
-    return emuenv.kernel.process_param;
-}
-
-EXPORT(int, sceKernelGetProcessTimeCore) {
-    TRACY_FUNC(sceKernelGetProcessTimeCore);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetProcessTimeLowCore) {
-    TRACY_FUNC(sceKernelGetProcessTimeLowCore);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetProcessTimeWideCore) {
-    TRACY_FUNC(sceKernelGetProcessTimeWideCore);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetProcessTitleId, char *title_id, uint32_t len) {
-    TRACY_FUNC(sceKernelGetProcessTitleId, title_id, len);
-    if (!title_id || len > 32 || len == 0)
-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    strncpy(title_id, emuenv.io.title_id.c_str(), len);
-    return 0;
-}
-
-EXPORT(int, sceKernelGetRemoteProcessTime) {
-    TRACY_FUNC(sceKernelGetRemoteProcessTime);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetStderr) {
-    TRACY_FUNC(sceKernelGetStderr);
-    return open_file(emuenv.io, "tty0:", SCE_O_WRONLY, emuenv.pref_path, export_name);
-}
-
-EXPORT(int, sceKernelGetStdin) {
-    TRACY_FUNC(sceKernelGetStdin);
-    return open_file(emuenv.io, "tty0:", SCE_O_RDONLY, emuenv.pref_path, export_name);
-}
-
-EXPORT(int, sceKernelGetStdout) {
-    TRACY_FUNC(sceKernelGetStdout);
-    return open_file(emuenv.io, "tty0:", SCE_O_WRONLY, emuenv.pref_path, export_name);
-}
-
-EXPORT(int, sceKernelIsCDialogAvailable) {
-    TRACY_FUNC(sceKernelIsCDialogAvailable);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelIsGameBudget) {
-    TRACY_FUNC(sceKernelIsGameBudget);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(VitaTime, sceKernelLibcClock) {
-    TRACY_FUNC(sceKernelLibcClock);
-    return static_cast<VitaTime>(rtc_get_ticks(emuenv.kernel.base_tick.tick) - emuenv.kernel.start_tick);
-}
-
-EXPORT(int, sceKernelLibcGettimeofday, VitaTimeval *timeAddr, VitaTimezone *tzAddr) {
-    TRACY_FUNC(sceKernelLibcGettimeofday, timeAddr, tzAddr);
-    const auto ticks = rtc_get_ticks(emuenv.kernel.base_tick.tick) - RTC_OFFSET;
-    if (timeAddr != nullptr) {
-        timeAddr->tv_sec = static_cast<std::uint32_t>(ticks / VITA_CLOCKS_PER_SEC);
-        timeAddr->tv_usec = ticks % VITA_CLOCKS_PER_SEC;
-    }
-    if (tzAddr != nullptr) {
-        std::time_t t = std::time(nullptr);
-
-        tm localtime_tm = {};
-
-        SAFE_LOCALTIME(&t, &localtime_tm);
-        std::time_t lt = mktime(&localtime_tm);
-        tzAddr->tz_minuteswest = static_cast<int>((lt - t) / 60);
-    }
-    return 0;
-}
-
-EXPORT(Ptr<VitaTM>, sceKernelLibcGmtime_r, const VitaTime *time, Ptr<VitaTM> date) {
-    TRACY_FUNC(sceKernelLibcGmtime_r, time, date);
-    const time_t plat_time = *time;
-
-    auto dateIn = date.get(emuenv.mem);
-
-    tm host_tm = {};
-    SAFE_GMTIME(&plat_time, &host_tm);
-    memcpy(dateIn, &host_tm, sizeof(VitaTM));
-
-    return date;
-}
-
-EXPORT(Ptr<VitaTM>, sceKernelLibcLocaltime_r, const VitaTime *time, Ptr<VitaTM> date) {
-    TRACY_FUNC(sceKernelLibcLocaltime_r, time, date);
-    const time_t plat_time = *time;
-    auto dateIn = date.get(emuenv.mem);
-
-    tm host_tm = {};
-    SAFE_LOCALTIME(&plat_time, &host_tm);
-    memcpy(dateIn, &host_tm, sizeof(VitaTM));
-
-    return date;
-}
-
-EXPORT(int, sceKernelLibcMktime, VitaTM *date, VitaTime *time, uint64_t *param_3) {
-    TRACY_FUNC(sceKernelLibcMktime, date, time);
-    // param_3 - result, 8 bytes, unused
-    if (!date) {
-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
-    bool year_1900 = false;
-    if (date->tm_year >= 1900) {
-        date->tm_year -= 1900;
-        year_1900 = true;
-    }
-    tm host_tm = {};
-    // Copy the input date to host_tm and use that on mktime instead of the input directly
-    // to avoid stack corruption on systems where tm size is different
-    memcpy(&host_tm, date, sizeof(VitaTM));
-    auto time_local = mktime(&host_tm);
-    memcpy(date, &host_tm, sizeof(VitaTM));
-    if (year_1900) {
-        date->tm_year += 1900;
-    }
-    if (time)
-        *time = static_cast<VitaTime>(time_local);
-    if (param_3)
-        *param_3 = time_local;
-    return 0;
-}
-
-EXPORT(VitaTime, sceKernelLibcTime, VitaTime *time) {
-    TRACY_FUNC(sceKernelLibcTime, time);
-    const auto secs = (rtc_get_ticks(emuenv.kernel.base_tick.tick) - RTC_OFFSET) / VITA_CLOCKS_PER_SEC;
-
-    if (time) {
-        *time = static_cast<VitaTime>(secs);
-    }
-
-    return static_cast<VitaTime>(secs);
-}
-
-EXPORT(int, sceKernelPowerLock) {
-    TRACY_FUNC(sceKernelPowerLock);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelPowerTick, SceKernelPowerTickType type) {
-    TRACY_FUNC(sceKernelPowerTick, type);
-    return SCE_KERNEL_OK;
-}
-
-EXPORT(int, sceKernelPowerUnlock) {
-    TRACY_FUNC(sceKernelPowerUnlock);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelRegisterProcessTerminationCallback) {
-    TRACY_FUNC(sceKernelRegisterProcessTerminationCallback);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelUnregisterProcessTerminationCallback) {
-    TRACY_FUNC(sceKernelUnregisterProcessTerminationCallback);
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceKernelGetMainModuleSdkVersion) {
-    TRACY_FUNC(sceKernelGetMainModuleSdkVersion);
-    SceProcessParam *process_param = emuenv.kernel.process_param.get(emuenv.mem);
-    if (process_param && (process_param->magic == '2PSP') && (process_param->version != 0)) {
-        return process_param->fw_version;
-    } else {
-        return 0;
-    }
+EXPORT(int, sceKernelWaitExceptionCBForMono) {
+    TRACY_FUNC(sceKernelWaitExceptionCBForMono);
+    return CALL_EXPORT(sceKernelWaitExceptionForMono);
 }
