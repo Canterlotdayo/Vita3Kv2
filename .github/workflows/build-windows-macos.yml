@@ -57,6 +57,9 @@ jobs:
     runs-on: macos-latest
     name: macOS
 
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -83,7 +86,9 @@ jobs:
           cmake --preset macos-ninja \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="-mmacosx-version-min=13.3" \
+            -DCMAKE_C_FLAGS="-mmacosx-version-min=13.3"
 
       - name: CMake Build
         run: cmake --build --preset macos-ninja-relwithdebinfo --parallel
