@@ -276,13 +276,6 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
     if (module_start) {
         const auto module_name = module.module_name;
 
-        // Skip modules known to trigger macOS condition_variable bug
-        const std::string name_str(module_name);
-        if (name_str.find("NpToolkit") != std::string::npos) {
-            LOG_WARN("Skipping module_start of {} (known to cause macOS threading crash)", module_name);
-            return SCE_KERNEL_START_SUCCESS;
-        }
-
         LOG_DEBUG("Running module_start of library: {} at address {}", module_name, log_hex(module_start.address()));
         SceInt32 priority = SCE_KERNEL_DEFAULT_PRIORITY_USER;
         SceInt32 stack_size = SCE_KERNEL_STACK_SIZE_USER_MAIN;

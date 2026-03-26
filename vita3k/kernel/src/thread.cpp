@@ -18,6 +18,8 @@
 #include <cpu/functions.h>
 #include <kernel/thread/thread_state.h>
 
+#include <thread>
+
 #include <kernel/state.h>
 #include <mem/ptr.h>
 #include <util/align.h>
@@ -372,11 +374,15 @@ uint32_t ThreadState::run_guest_function(Address callback_address, SceSize args,
     start(args, argp);
     {
         // wait for the function to return
-        std::unique_lock<std::mutex> lock(mutex);
-        if (status != ThreadStatus::dormant || to_do == ThreadToDo::run) {
-            status_cond.wait(lock, [&]() {
-                return status == ThreadStatus::dormant && to_do != ThreadToDo::run;
-            });
+        // Use polling with short sleep instead of condition_variable::wait
+        // to work around macOS pthread_cond_wait EINVAL bug
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (status == ThreadStatus::dormant && to_do != ThreadToDo::run) {
+                break;
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
 
