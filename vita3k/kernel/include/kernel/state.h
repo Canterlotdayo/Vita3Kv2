@@ -153,7 +153,7 @@ struct KernelState {
     // single-core cooperative scheduling (e.g., Mono's class init flags).
     // These mutexes ensure threads assigned to the same core don't run in parallel.
     static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
-    std::mutex core_mutex[NUM_CORES];
+    std::recursive_mutex core_mutex[NUM_CORES];
 
     // Mono exception handler mechanism:
     // On real Vita, when a thread hits a null pointer / illegal access, the kernel
