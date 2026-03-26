@@ -67,7 +67,7 @@ ExclusiveMonitorPtr CPUProtocol::get_exclusive_monitor() {
     return kernel->exclusive_monitor;
 }
 
-bool CPUProtocol::signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) {
+bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Address fault_pc) {
     // Only signal if Mono is loaded
     if (kernel->mono_code_start == 0)
         return false;
