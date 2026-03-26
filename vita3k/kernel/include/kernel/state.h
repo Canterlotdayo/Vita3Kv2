@@ -146,15 +146,6 @@ struct KernelState {
     Address mono_code_start = 0;
     Address mono_code_end = 0;
 
-    // Per-core mutexes to serialize threads on the same CPU core.
-    // On real Vita, threads with the same CPU affinity run on the same core
-    // and are time-sliced (never truly parallel). Vita3K runs each thread on
-    // its own host thread, causing race conditions in guest code that assumes
-    // single-core cooperative scheduling (e.g., Mono's class init flags).
-    // These mutexes ensure threads assigned to the same core don't run in parallel.
-    static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
-    std::recursive_mutex core_mutex[NUM_CORES];
-
     // Mono exception handler mechanism:
     // On real Vita, when a thread hits a null pointer / illegal access, the kernel
     // converts the hardware fault into a signal that wakes the Mono exception handler

@@ -375,10 +375,24 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {}
+    void AddTicks(uint64_t ticks) override {
+        ticks_remaining -= ticks;
+    }
 
     uint64_t GetTicksRemaining() override {
-        return 1ull << 60;
+        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
+    }
+
+    // Time quantum in ticks. When exhausted, Dynarmic returns from run()
+    // giving other threads a chance to execute. This emulates the real Vita's
+    // preemptive scheduling where threads on the same core are time-sliced.
+    // Without this, threads run until an SVC, causing race conditions in
+    // guest code that assumes cooperative scheduling (e.g., Mono class init).
+    static constexpr int64_t TICKS_QUANTUM = 1024;
+    int64_t ticks_remaining = TICKS_QUANTUM;
+
+    void reset_ticks() {
+        ticks_remaining = TICKS_QUANTUM;
     }
 };
 
@@ -393,12 +407,11 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    config.enable_cycle_counting = false;
+    config.enable_cycle_counting = true;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
-    config.enable_cycle_counting = false;
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }
@@ -421,8 +434,15 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     Dynarmic::HaltReason halt_reason;
+
+    // Time-sliced execution: run for a limited number of ticks then yield.
+    // This emulates the real Vita's preemptive per-core scheduling.
+    // Combined with per-core mutexes in run_loop, threads on the same core
+    // take turns instead of running in true parallel.
+    constexpr uint64_t QUANTUM = 1024;
+
     do {
-        halt_reason = jit->Run();
+        halt_reason = jit->Run(QUANTUM);
     } while ((halt_reason == Dynarmic::HaltReason::Step) || (halt_reason == Dynarmic::HaltReason::CacheInvalidation));
 
     return halted;
