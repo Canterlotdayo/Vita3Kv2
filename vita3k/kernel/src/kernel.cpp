@@ -68,7 +68,14 @@ static int SDLCALL thread_function(void *data) {
     }
 #endif
 
-    thread->run_loop();
+    try {
+        thread->run_loop();
+    } catch (const std::system_error &e) {
+        // macOS bug: pthread_cond_wait sporadically returns EINVAL
+        LOG_ERROR("Thread {} (ID: {}) caught system_error: {}", thread->name, thread->id, e.what());
+    } catch (const std::exception &e) {
+        LOG_ERROR("Thread {} (ID: {}) caught exception: {}", thread->name, thread->id, e.what());
+    }
     const uint32_t r0 = read_reg(*thread->cpu, 0);
 
     std::lock_guard<std::mutex> lock(params.kernel->mutex);
