@@ -66,3 +66,32 @@ Address CPUProtocol::get_watch_memory_addr(Address addr) {
 ExclusiveMonitorPtr CPUProtocol::get_exclusive_monitor() {
     return kernel->exclusive_monitor;
 }
+
+bool CPUProtocol::signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) {
+    // Only signal if Mono is loaded
+    if (kernel->mono_code_start == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
+
+    // Only signal if no exception is already pending
+    if (kernel->mono_exception_pending)
+        return false;
+
+    kernel->mono_exception_pending = true;
+    kernel->mono_exception_thread_id = thread_id;
+    kernel->mono_exception_fault_addr = fault_addr;
+    kernel->mono_exception_fault_pc = fault_pc;
+    kernel->mono_exception_cond.notify_one();
+
+    // Suspend the faulting thread so it waits for Mono to process the exception.
+    // Mono will call SuspendThreadForMono (no-op since already suspended),
+    // Get/SetThreadContextForMono (to redirect PC to C# exception handler),
+    // then ResumeThreadForMono to wake us.
+    auto thread = kernel->get_thread(thread_id);
+    if (thread) {
+        thread->suspend();
+    }
+
+    return true;
+}

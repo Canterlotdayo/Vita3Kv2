@@ -45,47 +45,49 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
 
 EXPORT(int, sceKernelWaitExceptionCBForMono) {
     TRACY_FUNC(sceKernelWaitExceptionCBForMono);
-    return UNIMPLEMENTED();
+    // Same as WaitExceptionForMono but with callback processing
+    // For now, delegate to the non-CB version
+    return CALL_EXPORT(sceKernelWaitExceptionForMono);
 }
 
 EXPORT(int, sceKernelWaitExceptionForMono) {
     TRACY_FUNC(sceKernelWaitExceptionForMono);
-    
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    if (thread && thread->cpu) {
-        // Dump full CPU context at the time of call to understand what the
-        // caller expects. The LR tells us where to return, and the stack
-        // contains the calling function's saved state.
-        uint32_t lr = read_lr(*thread->cpu);
-        uint32_t sp = read_sp(*thread->cpu);
-        uint32_t pc = read_pc(*thread->cpu);
-        
-        LOG_WARN("=== sceKernelWaitExceptionForMono called ===");
-        LOG_WARN("  Thread: {} (ID: {})", thread->name, thread_id);
-        LOG_WARN("  PC=0x{:08X}  LR=0x{:08X}  SP=0x{:08X}", pc, lr, sp);
-        for (int i = 0; i < 13; i++) {
-            LOG_WARN("  r{}=0x{:08X}", i, read_reg(*thread->cpu, i));
-        }
-        
-        // Dump stack (first 64 words = 256 bytes)
-        LOG_WARN("  Stack dump:");
-        for (int i = 0; i < 64; i++) {
-            uint32_t addr = sp + i * 4;
-            Ptr<uint32_t> ptr(addr);
-            if (ptr.valid(emuenv.mem)) {
-                uint32_t val = *ptr.get(emuenv.mem);
-                // Mark values that look like code addresses
-                const char *note = "";
-                if (val >= 0x84CF4000 && val < 0x84F48000) note = " <- mono code";
-                else if (val >= 0x80010000 && val < 0x83CB855C) note = " <- eboot";
-                else if (val >= 0x84518000 && val < 0x84570000) note = " <- libc";
-                LOG_WARN("  [SP+0x{:03X}] = 0x{:08X}{}", i * 4, val, note);
-            }
-        }
-        LOG_WARN("=== end WaitExceptionForMono context ===");
-    }
-    
-    STUBBED("Infinite wait - Mono exception handler will not function");
-    thread->suspend();
-    return 0;
+
+    // On real Vita, this function blocks until another thread triggers a
+    // hardware exception (null pointer dereference, illegal instruction, etc.).
+    // The kernel then wakes this thread with info about the faulting thread.
+    // Mono uses this to implement C# exception handling:
+    // 1. This function returns the faulting thread ID
+    // 2. Mono suspends the faulting thread
+    // 3. Mono reads the faulting thread's CPU context
+    // 4. Mono modifies PC to point to the C# exception handler
+    // 5. Mono resumes the faulting thread
+    //
+    // In Vita3K, Dynarmic detects null accesses in MemoryReadCode/MemoryRead
+    // and signals us via the mono_exception_* fields in KernelState.
+
+    LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
+
+    // Wait on the condition variable until an exception is signaled
+    std::unique_lock<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+    emuenv.kernel.mono_exception_cond.wait(lock, [&] {
+        return emuenv.kernel.mono_exception_pending;
+    });
+
+    // Exception received
+    SceUID faulting_tid = emuenv.kernel.mono_exception_thread_id;
+    Address fault_addr = emuenv.kernel.mono_exception_fault_addr;
+    Address fault_pc = emuenv.kernel.mono_exception_fault_pc;
+    emuenv.kernel.mono_exception_pending = false;
+
+    lock.unlock();
+
+    LOG_WARN("sceKernelWaitExceptionForMono: exception received! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
+             faulting_tid, fault_addr, fault_pc);
+
+    // Return the faulting thread ID
+    // On real Vita, the return value format may be more complex,
+    // but the thread ID is the essential piece Mono needs to call
+    // SuspendThreadForMono/GetThreadContextForMono etc.
+    return faulting_tid;
 }

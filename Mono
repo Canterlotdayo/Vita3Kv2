@@ -1,0 +1,319 @@
+diff --git a/vita3k/cpu/include/cpu/common.h b/vita3k/cpu/include/cpu/common.h
+index c79038d..c99a449 100644
+--- a/vita3k/cpu/include/cpu/common.h
++++ b/vita3k/cpu/include/cpu/common.h
+@@ -43,6 +43,14 @@ struct CPUProtocolBase {
+     virtual void call_svc(CPUState &cpu, uint32_t svc, Address pc, ThreadState &thread) = 0;
+     virtual Address get_watch_memory_addr(Address addr) = 0;
+     virtual ExclusiveMonitorPtr get_exclusive_monitor() = 0;
++
++    // Signal a memory fault to the Mono exception handler thread.
++    // Returns true if the exception was signaled (Mono is loaded and handler is waiting),
++    // false otherwise (caller should handle the fault itself).
++    // When true is returned, the faulting thread has been suspended and will be resumed
++    // by Mono after it processes the exception.
++    virtual bool signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) { return false; }
++
+     virtual ~CPUProtocolBase() = default;
+ };
+ 
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index c59d8f4..527c0b4 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -107,83 +107,42 @@ public:
+         if (cpu->log_mem)
+             LOG_TRACE("Instruction fetch at address 0x{:X}", addr);
+ 
+-        // Handle null function pointer calls: when PC=0 (or in first page),
+-        // the game called through a null pointer. Instead of spinning on invalid
+-        // instructions, redirect execution back to the caller (LR) so the thread
+-        // can continue. This is equivalent to the null function returning 0.
++        // Handle null function pointer calls (PC in first page = null pointer deref)
+         if (addr < parent->mem->page_size) {
+             auto lr = cpu->get_lr();
+ 
+-            // Detect infinite loop: if the same LR keeps calling null pointers,
+-            // the code at LR is in a loop that reads a vtable from a null object
+-            // and calls through it repeatedly (e.g., IEnumerator.MoveNext on a
+-            // null enumerator). Returning to LR just re-enters the loop.
+-            // After a few attempts, we need to escape further up the call stack.
++            // Try to signal the Mono exception handler. If Mono is loaded and
++            // the handler thread is waiting, this suspends the current thread
++            // and wakes the handler. Mono will modify our CPU context to jump
++            // to the C# exception handler and resume us.
++            if (parent->protocol &&
++                parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
++                // Thread has been suspended. Return NOP so Dynarmic exits cleanly.
++                return 0xE320F000;
++            }
++
++            // Fallback for non-Mono games or when handler isn't ready:
++            // return to LR with r0=0, throttle logging
+             if (lr == last_null_caller_lr) {
+                 null_call_count++;
+             } else {
+                 last_null_caller_lr = lr;
+                 null_call_count = 1;
+             }
+-
+-            if (null_call_count > 4) {
+-                // We're stuck in a loop at this LR. Read the stack to find
+-                // a return address further up the call chain and jump there.
+-                // The saved LR is typically at [SP] or [SP+offset] depending
+-                // on the function prologue.
+-                auto sp = cpu->jit->Regs()[13];
+-                uint32_t escape_lr = 0;
+-                // Scan stack for a plausible return address (in loaded module range)
+-                for (int i = 0; i < 32; i++) {
+-                    uint32_t stack_val_addr = sp + i * 4;
+-                    Ptr<uint32_t> ptr(stack_val_addr);
+-                    if (!ptr.valid(*parent->mem))
+-                        break;
+-                    uint32_t val = *ptr.get(*parent->mem);
+-                    // A valid return address is in a loaded module (above page_size, 
+-                    // below 0x90000000, and not the same LR we're stuck on)
+-                    if (val > parent->mem->page_size && val < 0x90000000 && val != lr) {
+-                        escape_lr = val;
+-                        // Set SP past this saved value to clean up the stack
+-                        cpu->jit->Regs()[13] = stack_val_addr + 4;
+-                        break;
+-                    }
+-                }
+-
+-                if (escape_lr != 0) {
+-                    LOG_WARN("Null function pointer loop detected (LR=0x{:X}, count={}). "
+-                             "Escaping to 0x{:X}", lr, null_call_count, escape_lr);
+-                    cpu->jit->Regs()[0] = 0;
+-                    cpu->set_pc(escape_lr);
+-                    cpu->jit->HaltExecution();
+-                    null_call_count = 0;
+-                    last_null_caller_lr = 0;
+-                    return 0xE320F000; // ARM NOP
+-                }
+-                // If we can't find an escape address, just keep returning to LR
+-                // but log less frequently to avoid log spam
+-                if ((null_call_count & 0xFF) == 0) {
+-                    LOG_WARN("Null function pointer loop at LR=0x{:X}, count={}, no escape found",
+-                             lr, null_call_count);
+-                }
+-            } else {
+-                LOG_WARN("Null function pointer call detected (PC=0x{:X}, LR=0x{:X}) - returning to caller", addr, lr);
++            if (null_call_count <= 4) {
++                LOG_WARN("Null function pointer call (PC=0x{:X}, LR=0x{:X}) - returning to caller", addr, lr);
+             }
+ 
+-            // Set return value to 0
+             cpu->jit->Regs()[0] = 0;
+-            // Set PC to LR to return to caller
+             cpu->set_pc(lr);
+-            // Halt current execution so run_loop picks up the new PC
+             cpu->jit->HaltExecution();
+-            // Return a NOP instruction so Dynarmic doesn't crash
+-            return 0xE320F000; // ARM NOP
++            return 0xE320F000;
+         }
+ 
+         return MemoryRead32(addr);
+     }
+ 
+-    // Track null function pointer call loops
++    // Track null function pointer call loops (fallback only)
+     Dynarmic::A32::VAddr last_null_caller_lr = 0;
+     uint32_t null_call_count = 0;
+ 
+diff --git a/vita3k/kernel/include/kernel/cpu_protocol.h b/vita3k/kernel/include/kernel/cpu_protocol.h
+index 24ea1c6..367da86 100644
+--- a/vita3k/kernel/include/kernel/cpu_protocol.h
++++ b/vita3k/kernel/include/kernel/cpu_protocol.h
+@@ -30,6 +30,7 @@ struct CPUProtocol : public CPUProtocolBase {
+     void call_svc(CPUState &cpu, uint32_t svc, Address pc, ThreadState &thread) override;
+     Address get_watch_memory_addr(Address addr) override;
+     ExclusiveMonitorPtr get_exclusive_monitor() override;
++    bool signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) override;
+ 
+ private:
+     CallImportFunc call_import;
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index 84e42cf..d85d7b7 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -31,6 +31,7 @@
+ #include <util/types.h>
+ 
+ #include <atomic>
++#include <condition_variable>
+ #include <map>
+ #include <mutex>
+ #include <vector>
+@@ -146,6 +147,23 @@ struct KernelState {
+     Address mono_code_start = 0;
+     Address mono_code_end = 0;
+ 
++    // Mono exception handler mechanism:
++    // On real Vita, when a thread hits a null pointer / illegal access, the kernel
++    // converts the hardware fault into a signal that wakes the Mono exception handler
++    // thread via sceKernelWaitExceptionForMono(). The exception handler then suspends
++    // the faulting thread, reads/modifies its CPU context (to redirect PC to the C#
++    // exception handler), and resumes it.
++    //
++    // In Vita3K, Dynarmic doesn't generate real hardware faults. Instead, MemoryReadCode
++    // and MemoryRead detect null accesses. We signal the exception handler thread here
++    // and suspend the faulting thread until Mono processes the exception.
++    std::mutex mono_exception_mutex;
++    std::condition_variable mono_exception_cond;
++    bool mono_exception_pending = false;
++    SceUID mono_exception_thread_id = 0;      // faulting thread ID
++    Address mono_exception_fault_addr = 0;     // address that caused the fault
++    Address mono_exception_fault_pc = 0;       // PC at time of fault
++
+     uint64_t start_tick;
+     SceRtcTick base_tick;
+     Ptr<SceProcessParam> process_param;
+diff --git a/vita3k/kernel/src/cpu_protocol.cpp b/vita3k/kernel/src/cpu_protocol.cpp
+index c9acf27..3732ff0 100644
+--- a/vita3k/kernel/src/cpu_protocol.cpp
++++ b/vita3k/kernel/src/cpu_protocol.cpp
+@@ -66,3 +66,32 @@ Address CPUProtocol::get_watch_memory_addr(Address addr) {
+ ExclusiveMonitorPtr CPUProtocol::get_exclusive_monitor() {
+     return kernel->exclusive_monitor;
+ }
++
++bool CPUProtocol::signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) {
++    // Only signal if Mono is loaded
++    if (kernel->mono_code_start == 0)
++        return false;
++
++    std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
++
++    // Only signal if no exception is already pending
++    if (kernel->mono_exception_pending)
++        return false;
++
++    kernel->mono_exception_pending = true;
++    kernel->mono_exception_thread_id = thread_id;
++    kernel->mono_exception_fault_addr = fault_addr;
++    kernel->mono_exception_fault_pc = fault_pc;
++    kernel->mono_exception_cond.notify_one();
++
++    // Suspend the faulting thread so it waits for Mono to process the exception.
++    // Mono will call SuspendThreadForMono (no-op since already suspended),
++    // Get/SetThreadContextForMono (to redirect PC to C# exception handler),
++    // then ResumeThreadForMono to wake us.
++    auto thread = kernel->get_thread(thread_id);
++    if (thread) {
++        thread->suspend();
++    }
++
++    return true;
++}
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 9667c8d..6c302f6 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -413,7 +413,10 @@ Address ThreadState::stack_top() const {
+ }
+ 
+ void ThreadState::suspend() {
+-    assert(to_do == ThreadToDo::run);
++    // Allow suspend on already-suspended threads (e.g., when Mono exception handler
++    // calls SuspendThreadForMono on a thread we already suspended in signal_mono_exception)
++    if (to_do != ThreadToDo::run)
++        return;
+     to_do = ThreadToDo::suspend;
+     stop(*cpu);
+ }
+diff --git a/vita3k/modules/SceLibKernel/SceKernelForMono.cpp b/vita3k/modules/SceLibKernel/SceKernelForMono.cpp
+index f7059ab..4866f74 100644
+--- a/vita3k/modules/SceLibKernel/SceKernelForMono.cpp
++++ b/vita3k/modules/SceLibKernel/SceKernelForMono.cpp
+@@ -45,47 +45,49 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
+ 
+ EXPORT(int, sceKernelWaitExceptionCBForMono) {
+     TRACY_FUNC(sceKernelWaitExceptionCBForMono);
+-    return UNIMPLEMENTED();
++    // Same as WaitExceptionForMono but with callback processing
++    // For now, delegate to the non-CB version
++    return CALL_EXPORT(sceKernelWaitExceptionForMono);
+ }
+ 
+ EXPORT(int, sceKernelWaitExceptionForMono) {
+     TRACY_FUNC(sceKernelWaitExceptionForMono);
+-    
+-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+-    if (thread && thread->cpu) {
+-        // Dump full CPU context at the time of call to understand what the
+-        // caller expects. The LR tells us where to return, and the stack
+-        // contains the calling function's saved state.
+-        uint32_t lr = read_lr(*thread->cpu);
+-        uint32_t sp = read_sp(*thread->cpu);
+-        uint32_t pc = read_pc(*thread->cpu);
+-        
+-        LOG_WARN("=== sceKernelWaitExceptionForMono called ===");
+-        LOG_WARN("  Thread: {} (ID: {})", thread->name, thread_id);
+-        LOG_WARN("  PC=0x{:08X}  LR=0x{:08X}  SP=0x{:08X}", pc, lr, sp);
+-        for (int i = 0; i < 13; i++) {
+-            LOG_WARN("  r{}=0x{:08X}", i, read_reg(*thread->cpu, i));
+-        }
+-        
+-        // Dump stack (first 64 words = 256 bytes)
+-        LOG_WARN("  Stack dump:");
+-        for (int i = 0; i < 64; i++) {
+-            uint32_t addr = sp + i * 4;
+-            Ptr<uint32_t> ptr(addr);
+-            if (ptr.valid(emuenv.mem)) {
+-                uint32_t val = *ptr.get(emuenv.mem);
+-                // Mark values that look like code addresses
+-                const char *note = "";
+-                if (val >= 0x84CF4000 && val < 0x84F48000) note = " <- mono code";
+-                else if (val >= 0x80010000 && val < 0x83CB855C) note = " <- eboot";
+-                else if (val >= 0x84518000 && val < 0x84570000) note = " <- libc";
+-                LOG_WARN("  [SP+0x{:03X}] = 0x{:08X}{}", i * 4, val, note);
+-            }
+-        }
+-        LOG_WARN("=== end WaitExceptionForMono context ===");
+-    }
+-    
+-    STUBBED("Infinite wait - Mono exception handler will not function");
+-    thread->suspend();
+-    return 0;
++
++    // On real Vita, this function blocks until another thread triggers a
++    // hardware exception (null pointer dereference, illegal instruction, etc.).
++    // The kernel then wakes this thread with info about the faulting thread.
++    // Mono uses this to implement C# exception handling:
++    // 1. This function returns the faulting thread ID
++    // 2. Mono suspends the faulting thread
++    // 3. Mono reads the faulting thread's CPU context
++    // 4. Mono modifies PC to point to the C# exception handler
++    // 5. Mono resumes the faulting thread
++    //
++    // In Vita3K, Dynarmic detects null accesses in MemoryReadCode/MemoryRead
++    // and signals us via the mono_exception_* fields in KernelState.
++
++    LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
++
++    // Wait on the condition variable until an exception is signaled
++    std::unique_lock<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
++    emuenv.kernel.mono_exception_cond.wait(lock, [&] {
++        return emuenv.kernel.mono_exception_pending;
++    });
++
++    // Exception received
++    SceUID faulting_tid = emuenv.kernel.mono_exception_thread_id;
++    Address fault_addr = emuenv.kernel.mono_exception_fault_addr;
++    Address fault_pc = emuenv.kernel.mono_exception_fault_pc;
++    emuenv.kernel.mono_exception_pending = false;
++
++    lock.unlock();
++
++    LOG_WARN("sceKernelWaitExceptionForMono: exception received! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
++             faulting_tid, fault_addr, fault_pc);
++
++    // Return the faulting thread ID
++    // On real Vita, the return value format may be more complex,
++    // but the thread ID is the essential piece Mono needs to call
++    // SuspendThreadForMono/GetThreadContextForMono etc.
++    return faulting_tid;
+ }
+\ No newline at end of file

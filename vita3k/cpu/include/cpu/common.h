@@ -43,6 +43,14 @@ struct CPUProtocolBase {
     virtual void call_svc(CPUState &cpu, uint32_t svc, Address pc, ThreadState &thread) = 0;
     virtual Address get_watch_memory_addr(Address addr) = 0;
     virtual ExclusiveMonitorPtr get_exclusive_monitor() = 0;
+
+    // Signal a memory fault to the Mono exception handler thread.
+    // Returns true if the exception was signaled (Mono is loaded and handler is waiting),
+    // false otherwise (caller should handle the fault itself).
+    // When true is returned, the faulting thread has been suspended and will be resumed
+    // by Mono after it processes the exception.
+    virtual bool signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) { return false; }
+
     virtual ~CPUProtocolBase() = default;
 };
 

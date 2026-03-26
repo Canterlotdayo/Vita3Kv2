@@ -107,83 +107,42 @@ public:
         if (cpu->log_mem)
             LOG_TRACE("Instruction fetch at address 0x{:X}", addr);
 
-        // Handle null function pointer calls: when PC=0 (or in first page),
-        // the game called through a null pointer. Instead of spinning on invalid
-        // instructions, redirect execution back to the caller (LR) so the thread
-        // can continue. This is equivalent to the null function returning 0.
+        // Handle null function pointer calls (PC in first page = null pointer deref)
         if (addr < parent->mem->page_size) {
             auto lr = cpu->get_lr();
 
-            // Detect infinite loop: if the same LR keeps calling null pointers,
-            // the code at LR is in a loop that reads a vtable from a null object
-            // and calls through it repeatedly (e.g., IEnumerator.MoveNext on a
-            // null enumerator). Returning to LR just re-enters the loop.
-            // After a few attempts, we need to escape further up the call stack.
+            // Try to signal the Mono exception handler. If Mono is loaded and
+            // the handler thread is waiting, this suspends the current thread
+            // and wakes the handler. Mono will modify our CPU context to jump
+            // to the C# exception handler and resume us.
+            if (parent->protocol &&
+                parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
+                // Thread has been suspended. Return NOP so Dynarmic exits cleanly.
+                return 0xE320F000;
+            }
+
+            // Fallback for non-Mono games or when handler isn't ready:
+            // return to LR with r0=0, throttle logging
             if (lr == last_null_caller_lr) {
                 null_call_count++;
             } else {
                 last_null_caller_lr = lr;
                 null_call_count = 1;
             }
-
-            if (null_call_count > 4) {
-                // We're stuck in a loop at this LR. Read the stack to find
-                // a return address further up the call chain and jump there.
-                // The saved LR is typically at [SP] or [SP+offset] depending
-                // on the function prologue.
-                auto sp = cpu->jit->Regs()[13];
-                uint32_t escape_lr = 0;
-                // Scan stack for a plausible return address (in loaded module range)
-                for (int i = 0; i < 32; i++) {
-                    uint32_t stack_val_addr = sp + i * 4;
-                    Ptr<uint32_t> ptr(stack_val_addr);
-                    if (!ptr.valid(*parent->mem))
-                        break;
-                    uint32_t val = *ptr.get(*parent->mem);
-                    // A valid return address is in a loaded module (above page_size, 
-                    // below 0x90000000, and not the same LR we're stuck on)
-                    if (val > parent->mem->page_size && val < 0x90000000 && val != lr) {
-                        escape_lr = val;
-                        // Set SP past this saved value to clean up the stack
-                        cpu->jit->Regs()[13] = stack_val_addr + 4;
-                        break;
-                    }
-                }
-
-                if (escape_lr != 0) {
-                    LOG_WARN("Null function pointer loop detected (LR=0x{:X}, count={}). "
-                             "Escaping to 0x{:X}", lr, null_call_count, escape_lr);
-                    cpu->jit->Regs()[0] = 0;
-                    cpu->set_pc(escape_lr);
-                    cpu->jit->HaltExecution();
-                    null_call_count = 0;
-                    last_null_caller_lr = 0;
-                    return 0xE320F000; // ARM NOP
-                }
-                // If we can't find an escape address, just keep returning to LR
-                // but log less frequently to avoid log spam
-                if ((null_call_count & 0xFF) == 0) {
-                    LOG_WARN("Null function pointer loop at LR=0x{:X}, count={}, no escape found",
-                             lr, null_call_count);
-                }
-            } else {
-                LOG_WARN("Null function pointer call detected (PC=0x{:X}, LR=0x{:X}) - returning to caller", addr, lr);
+            if (null_call_count <= 4) {
+                LOG_WARN("Null function pointer call (PC=0x{:X}, LR=0x{:X}) - returning to caller", addr, lr);
             }
 
-            // Set return value to 0
             cpu->jit->Regs()[0] = 0;
-            // Set PC to LR to return to caller
             cpu->set_pc(lr);
-            // Halt current execution so run_loop picks up the new PC
             cpu->jit->HaltExecution();
-            // Return a NOP instruction so Dynarmic doesn't crash
-            return 0xE320F000; // ARM NOP
+            return 0xE320F000;
         }
 
         return MemoryRead32(addr);
     }
 
-    // Track null function pointer call loops
+    // Track null function pointer call loops (fallback only)
     Dynarmic::A32::VAddr last_null_caller_lr = 0;
     uint32_t null_call_count = 0;
 

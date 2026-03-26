@@ -31,6 +31,7 @@
 #include <util/types.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -145,6 +146,23 @@ struct KernelState {
     // caused by concurrent JIT compilation on multiple threads).
     Address mono_code_start = 0;
     Address mono_code_end = 0;
+
+    // Mono exception handler mechanism:
+    // On real Vita, when a thread hits a null pointer / illegal access, the kernel
+    // converts the hardware fault into a signal that wakes the Mono exception handler
+    // thread via sceKernelWaitExceptionForMono(). The exception handler then suspends
+    // the faulting thread, reads/modifies its CPU context (to redirect PC to the C#
+    // exception handler), and resumes it.
+    //
+    // In Vita3K, Dynarmic doesn't generate real hardware faults. Instead, MemoryReadCode
+    // and MemoryRead detect null accesses. We signal the exception handler thread here
+    // and suspend the faulting thread until Mono processes the exception.
+    std::mutex mono_exception_mutex;
+    std::condition_variable mono_exception_cond;
+    bool mono_exception_pending = false;
+    SceUID mono_exception_thread_id = 0;      // faulting thread ID
+    Address mono_exception_fault_addr = 0;     // address that caused the fault
+    Address mono_exception_fault_pc = 0;       // PC at time of fault
 
     uint64_t start_tick;
     SceRtcTick base_tick;

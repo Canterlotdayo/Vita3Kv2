@@ -30,6 +30,7 @@ struct CPUProtocol : public CPUProtocolBase {
     void call_svc(CPUState &cpu, uint32_t svc, Address pc, ThreadState &thread) override;
     Address get_watch_memory_addr(Address addr) override;
     ExclusiveMonitorPtr get_exclusive_monitor() override;
+    bool signal_mono_exception(SceUID thread_id, Address fault_addr, Address fault_pc) override;
 
 private:
     CallImportFunc call_import;
