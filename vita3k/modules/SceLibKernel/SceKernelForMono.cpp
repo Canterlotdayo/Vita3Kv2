@@ -46,42 +46,34 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
 EXPORT(int, sceKernelWaitExceptionForMono) {
     TRACY_FUNC(sceKernelWaitExceptionForMono);
 
-    // On real Vita, this function blocks until another thread triggers a
-    // hardware exception (null pointer dereference, illegal instruction, etc.).
-    // The kernel then wakes this thread with info about the faulting thread.
-    // Mono uses this to implement C# exception handling:
-    // 1. This function returns the faulting thread ID
-    // 2. Mono suspends the faulting thread
-    // 3. Mono reads the faulting thread's CPU context
-    // 4. Mono modifies PC to point to the C# exception handler
-    // 5. Mono resumes the faulting thread
-    //
-    // In Vita3K, Dynarmic detects null accesses in MemoryReadCode/MemoryRead
-    // and signals us via the mono_exception_* fields in KernelState.
-
     LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
 
-    // Wait on the condition variable until an exception is signaled
-    std::unique_lock<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
-    emuenv.kernel.mono_exception_cond.wait(lock, [&] {
-        return emuenv.kernel.mono_exception_pending;
-    });
+    // Register this thread as the Mono exception handler thread.
+    // When a null pointer fault is detected in MemoryReadCode, the faulting thread
+    // will be suspended and this thread will be resumed with the fault info.
+    {
+        std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+        emuenv.kernel.mono_exception_handler_thread = thread_id;
+    }
 
-    // Exception received
+    // Suspend this guest thread using the normal guest thread mechanism.
+    // It will be woken up by signal_mono_exception() calling resume() on us.
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (!thread)
+        return -1;
+
+    thread->suspend();
+
+    // When we wake up, the exception info is in KernelState
+    std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
     SceUID faulting_tid = emuenv.kernel.mono_exception_thread_id;
     Address fault_addr = emuenv.kernel.mono_exception_fault_addr;
     Address fault_pc = emuenv.kernel.mono_exception_fault_pc;
     emuenv.kernel.mono_exception_pending = false;
 
-    lock.unlock();
-
-    LOG_WARN("sceKernelWaitExceptionForMono: exception received! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
+    LOG_WARN("sceKernelWaitExceptionForMono: woke up! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
              faulting_tid, fault_addr, fault_pc);
 
-    // Return the faulting thread ID
-    // On real Vita, the return value format may be more complex,
-    // but the thread ID is the essential piece Mono needs to call
-    // SuspendThreadForMono/GetThreadContextForMono etc.
     return faulting_tid;
 }
 

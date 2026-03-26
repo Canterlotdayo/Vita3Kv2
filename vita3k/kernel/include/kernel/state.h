@@ -31,7 +31,6 @@
 #include <util/types.h>
 
 #include <atomic>
-#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -158,9 +157,9 @@ struct KernelState {
     // and MemoryRead detect null accesses. We signal the exception handler thread here
     // and suspend the faulting thread until Mono processes the exception.
     std::mutex mono_exception_mutex;
-    std::condition_variable mono_exception_cond;
     bool mono_exception_pending = false;
-    SceUID mono_exception_thread_id = 0;      // faulting thread ID
+    SceUID mono_exception_handler_thread = 0;  // thread ID of ExceptionHandlerThread (waiting in WaitExceptionForMono)
+    SceUID mono_exception_thread_id = 0;       // faulting thread ID
     Address mono_exception_fault_addr = 0;     // address that caused the fault
     Address mono_exception_fault_pc = 0;       // PC at time of fault
 
