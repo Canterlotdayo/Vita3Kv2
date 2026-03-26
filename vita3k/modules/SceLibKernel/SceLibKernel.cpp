@@ -1117,12 +1117,9 @@ EXPORT(int, sceKernelCallModuleExit) {
     }
     LOG_INFO("==========================");
 
-    // This function is called when a module wants to invoke its stop entry and unload.
-    // The minimal correct behavior is to terminate the calling thread.
-    if (thread) {
-        thread->exit_delete();
-    }
-
+    // Do NOT call exit_delete() here — this function is called during normal
+    // module lifecycle (e.g. Unity plugin init/shutdown) and killing the thread
+    // causes condition_variable crashes in other threads still running.
     return 0;
 }
 
