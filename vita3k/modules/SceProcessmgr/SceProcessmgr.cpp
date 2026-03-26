@@ -25,6 +25,9 @@
 #include <util/safe_time.h>
 
 #include <util/tracy.h>
+
+#include <string>
+#include <vector>
 TRACY_MODULE_NAME(SceProcessmgr);
 
 template <>
@@ -112,20 +115,21 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     // the second finds the hash slot already occupied. The assertion fires and calls abort().
     //
     // We can't just return 0 from abort() because it's __attribute__((noreturn)) - the
-    // compiler didn't emit valid code after the call to abort(). Returning would execute
-    // garbage instructions and crash.
+    // compiler didn't emit valid code after the call to abort().
     //
     // We can't just kill the thread with exit(0) either, because the JIT compilation work
     // it was doing never completes, leaving NULL function pointers that cause infinite
     // invalid-read loops later (the "red circle freeze").
     //
-    // Solution: walk the ARM frame pointer chain to unwind the stack past the assertion
-    // and the insert function. This returns control to the caller of
-    // mono_internal_hash_table_insert() as if the insert simply returned, which is safe
-    // because the entry already exists in the table (the duplicate is identical).
+    // Solution: scan the thread's stack for return addresses pointing into the Mono code
+    // segment. The code is compiled without frame pointers (-fomit-frame-pointer), so we
+    // can't walk a frame chain. Instead we scan every aligned word on the stack looking
+    // for values in the Mono code range. We need to find at least 2 such addresses:
+    // one for the assertion helper and one for mono_internal_hash_table_insert.
+    // We skip past both and return to the caller of the insert function.
     //
     // Call chain when assertion fires:
-    //   mono code -> mono_internal_hash_table_insert() -> g_assertion_message_expr()
+    //   [caller] -> mono_internal_hash_table_insert() -> g_assertion_message_expr()
     //     -> abort() [SceLibc] -> sceKernelCallAbortHandler [we are here]
 
     bool is_mono_abort = false;
@@ -139,75 +143,105 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     }
 
     if (is_mono_abort && thread && thread->cpu) {
-        LOG_WARN("Mono abort handler: thread {} (ID: {}), params: 0x{:X}, 0x{:X} - attempting stack unwind",
+        LOG_WARN("Mono abort handler: thread {} (ID: {}), params: 0x{:X}, 0x{:X} - attempting stack scan unwind",
                  tname, thread_id, param1, param2);
 
-        // Walk the ARM frame pointer chain.
-        // ARM calling convention with frame pointer:
-        //   prologue: push {r4-rN, r11, lr}; add r11, sp, #offset
-        //   [r11+0] = saved r11 (previous frame pointer)
-        //   [r11+4] = saved lr  (return address)
-        //
-        // We unwind until we find a return address pointing into the Mono code segment.
-        // That frame is mono_internal_hash_table_insert() or its immediate caller.
-        // We then go one more frame up to skip the insert entirely.
+        uint32_t sp = read_sp(*thread->cpu);
+        uint32_t lr = read_lr(*thread->cpu);
+        uint32_t r11 = read_reg(*thread->cpu, 11);
 
-        uint32_t fp = read_reg(*thread->cpu, 11); // r11 = frame pointer
-        uint32_t target_pc = 0;
-        uint32_t target_sp = 0;
-        uint32_t target_fp = 0;
+        LOG_WARN("  SP=0x{:08X}, LR=0x{:08X}, R11=0x{:08X}, PC=0x{:08X}",
+                 sp, lr, r11, read_pc(*thread->cpu));
 
-        for (int i = 0; i < 8; i++) {
-            if (fp == 0 || fp < emuenv.mem.page_size)
+        // Scan the stack for return addresses in the Mono code segment.
+        // On ARM, saved LR values are pushed on the stack by each function.
+        // We scan upward from SP, collecting addresses that fall in Mono's code range.
+        // We need at least 2: the first is likely in g_assertion_message / abort helpers,
+        // the second (or third) is in mono_internal_hash_table_insert or its caller.
+
+        const Address mono_start = emuenv.kernel.mono_code_start;
+        const Address mono_end = emuenv.kernel.mono_code_end;
+
+        struct StackRetAddr {
+            uint32_t sp_offset;
+            uint32_t addr;
+        };
+        std::vector<StackRetAddr> mono_addrs;
+
+        // Scan up to 512 bytes (128 words) on the stack
+        const int scan_words = 128;
+        for (int i = 0; i < scan_words; i++) {
+            uint32_t stack_addr = sp + i * 4;
+            Ptr<uint32_t> ptr(stack_addr);
+            if (!ptr.valid(emuenv.mem))
                 break;
 
-            Ptr<uint32_t> fp_ptr(fp);
-            if (!fp_ptr.valid(emuenv.mem))
-                break;
+            uint32_t val = *ptr.get(emuenv.mem);
 
-            uint32_t saved_fp = *Ptr<uint32_t>(fp).get(emuenv.mem);
-            uint32_t saved_lr = *Ptr<uint32_t>(fp + 4).get(emuenv.mem);
-
-            LOG_DEBUG("  Frame {}: fp=0x{:08X}, saved_fp=0x{:08X}, saved_lr=0x{:08X}", i, fp, saved_fp, saved_lr);
-
-            // Look for the first frame whose return address points into Mono code.
-            // This is the frame that called into the assertion/abort chain.
-            if (saved_lr >= emuenv.kernel.mono_code_start && saved_lr < emuenv.kernel.mono_code_end) {
-                // Go one MORE frame up to skip mono_internal_hash_table_insert itself
-                if (saved_fp != 0 && saved_fp >= emuenv.mem.page_size) {
-                    Ptr<uint32_t> next_fp_ptr(saved_fp);
-                    if (next_fp_ptr.valid(emuenv.mem)) {
-                        uint32_t next_saved_fp = *Ptr<uint32_t>(saved_fp).get(emuenv.mem);
-                        uint32_t next_saved_lr = *Ptr<uint32_t>(saved_fp + 4).get(emuenv.mem);
-                        target_pc = next_saved_lr;
-                        target_sp = saved_fp + 8;
-                        target_fp = next_saved_fp;
-                        LOG_DEBUG("  Target (skip insert): PC=0x{:08X}, SP=0x{:08X}, FP=0x{:08X}",
-                                  target_pc, target_sp, target_fp);
-                    }
-                }
-                // Fallback: return to this frame if we can't go one more up
-                if (target_pc == 0) {
-                    target_pc = saved_lr;
-                    target_sp = fp + 8;
-                    target_fp = saved_fp;
-                }
-                break;
+            // Check if this value looks like a return address in Mono code
+            // Return addresses are usually odd (Thumb) or even (ARM) but always > page_size
+            // and within the Mono code segment
+            if (val >= mono_start && val < mono_end) {
+                mono_addrs.push_back({ static_cast<uint32_t>(i * 4), val });
+                LOG_DEBUG("  Stack[SP+0x{:X}] = 0x{:08X} (Mono code)", i * 4, val);
             }
-            fp = saved_fp;
         }
 
-        if (target_pc != 0 && target_pc > emuenv.mem.page_size) {
-            LOG_WARN("Mono abort handler: unwinding to PC=0x{:08X}, SP=0x{:08X}, FP=0x{:08X}",
-                     target_pc, target_sp, target_fp);
+        LOG_WARN("  Found {} Mono return addresses on stack", mono_addrs.size());
+
+        // We want to skip past the assertion code and the hash table insert.
+        // Heuristic: pick the 3rd Mono return address if available (skips assert helper,
+        // the insert function, and lands in the caller), otherwise the 2nd, then 1st.
+        int target_idx = -1;
+        if (mono_addrs.size() >= 3)
+            target_idx = 2;
+        else if (mono_addrs.size() >= 2)
+            target_idx = 1;
+        else if (mono_addrs.size() >= 1)
+            target_idx = 0;
+
+        if (target_idx >= 0) {
+            uint32_t target_pc = mono_addrs[target_idx].addr;
+            // Set SP to just past the return address we picked (clean up the stack)
+            uint32_t target_sp = sp + mono_addrs[target_idx].sp_offset + 4;
+
+            LOG_WARN("Mono abort handler: unwinding to PC=0x{:08X}, SP=0x{:08X} (idx={})",
+                     target_pc, target_sp, target_idx);
+
             write_pc(*thread->cpu, target_pc);
             write_sp(*thread->cpu, target_sp);
-            write_reg(*thread->cpu, 11, target_fp);
-            write_reg(*thread->cpu, 0, 0); // return value = 0 (success)
+            write_reg(*thread->cpu, 0, 0); // return value = 0
             return 0;
         }
 
-        // Stack unwind failed - fall through to kill the thread as last resort
+        // Stack scan also failed - extend scan range
+        LOG_WARN("  Short scan failed, trying extended scan (2048 bytes)...");
+        const int extended_scan = 512;
+        for (int i = scan_words; i < extended_scan; i++) {
+            uint32_t stack_addr = sp + i * 4;
+            Ptr<uint32_t> ptr(stack_addr);
+            if (!ptr.valid(emuenv.mem))
+                break;
+
+            uint32_t val = *ptr.get(emuenv.mem);
+            if (val >= mono_start && val < mono_end) {
+                mono_addrs.push_back({ static_cast<uint32_t>(i * 4), val });
+                LOG_DEBUG("  Stack[SP+0x{:X}] = 0x{:08X} (Mono code, extended)", i * 4, val);
+                // Use the first one found in extended range
+                if (mono_addrs.size() >= 2) {
+                    uint32_t target_pc = val;
+                    uint32_t target_sp = sp + i * 4 + 4;
+                    LOG_WARN("Mono abort handler: unwinding (extended) to PC=0x{:08X}, SP=0x{:08X}",
+                             target_pc, target_sp);
+                    write_pc(*thread->cpu, target_pc);
+                    write_sp(*thread->cpu, target_sp);
+                    write_reg(*thread->cpu, 0, 0);
+                    return 0;
+                }
+            }
+        }
+
+        // All unwind attempts failed - kill the thread as last resort
         LOG_ERROR("Mono abort handler: stack unwind failed for thread {} (ID: {}), killing thread",
                   tname, thread_id);
         thread->exit(0);
