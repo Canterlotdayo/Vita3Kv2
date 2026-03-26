@@ -435,14 +435,13 @@ int DynarmicCPU::run() {
     parent->svc_called = false;
     Dynarmic::HaltReason halt_reason;
 
-    // Time-sliced execution: run for a limited number of ticks then yield.
-    // This emulates the real Vita's preemptive per-core scheduling.
-    // Combined with per-core mutexes in run_loop, threads on the same core
-    // take turns instead of running in true parallel.
-    constexpr uint64_t QUANTUM = 1024;
+    // Reset the tick quantum before each run.
+    // GetTicksRemaining() returns the remaining ticks, and Dynarmic stops
+    // when they reach 0. This gives preemptive-style time slicing.
+    cb->reset_ticks();
 
     do {
-        halt_reason = jit->Run(QUANTUM);
+        halt_reason = jit->Run();
     } while ((halt_reason == Dynarmic::HaltReason::Step) || (halt_reason == Dynarmic::HaltReason::CacheInvalidation));
 
     return halted;
