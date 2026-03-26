@@ -108,10 +108,9 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // Kill the thread to prevent abort()'s cleanup chain from reaching
-    // sceKernelExitProcess which would kill the entire emulator.
-    // The yield-on-STREX-failure in MemoryWriteExclusive should prevent
-    // the Mono "pending init" race condition from occurring in the first place.
+    // Terminate the thread to prevent abort()'s chain from reaching
+    // sceKernelExitProcess. With per-core time-sliced scheduling,
+    // the Mono race condition should not occur in the first place.
     if (thread) {
         thread->exit_delete(false);
     }

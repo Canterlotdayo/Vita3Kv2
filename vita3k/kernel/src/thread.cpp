@@ -259,14 +259,43 @@ bool ThreadState::run_loop() {
                 }
             }
 
+            // Per-core time-sliced scheduling.
+            // On the real Vita, threads with the same CPU affinity share a core
+            // and are preemptively time-sliced. Only one thread runs per core at
+            // a time. We emulate this with:
+            // - Cycle-limited run() (quantum) so threads yield the core frequently
+            // - Per-core mutex with try_lock (never blocks, avoids deadlock)
+            // - yield() when the core is busy (lets the other thread finish its quantum)
+            int core_idx;
+            if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT) {
+                core_idx = id % KernelState::NUM_CORES;
+            } else if (affinity_mask & 0x10000) {
+                core_idx = 0;
+            } else if (affinity_mask & 0x20000) {
+                core_idx = 1;
+            } else {
+                core_idx = 2;
+            }
+
             // Run the cpu
             do {
+                // Try to acquire this core. If another thread on the same core
+                // is running, yield and retry. Never block (no deadlock possible).
+                while (!kernel.core_mutex[core_idx].try_lock()) {
+                    std::this_thread::yield();
+                    // If we've been told to stop while waiting, break out
+                    if (to_do != ThreadToDo::run && to_do != ThreadToDo::step)
+                        break;
+                }
+
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
-
-                } else
+                } else {
                     res = run(*cpu);
+                }
+
+                kernel.core_mutex[core_idx].unlock();
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {

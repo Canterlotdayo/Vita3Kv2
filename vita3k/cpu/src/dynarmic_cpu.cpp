@@ -387,10 +387,22 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {}
+    void AddTicks(uint64_t ticks) override {
+        ticks_remaining -= static_cast<int64_t>(ticks);
+    }
 
     uint64_t GetTicksRemaining() override {
-        return 1ull << 60;
+        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
+    }
+
+    // Scheduling quantum. Dynarmic returns from run() when ticks reach 0.
+    // On real Vita (~333 MHz), a 1ms time slice = ~333k cycles.
+    // We use a smaller quantum for more responsive scheduling.
+    static constexpr int64_t QUANTUM = 1024;
+    int64_t ticks_remaining = QUANTUM;
+
+    void reset_ticks() {
+        ticks_remaining = QUANTUM;
     }
 };
 
@@ -405,7 +417,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    config.enable_cycle_counting = false;
+    config.enable_cycle_counting = true;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
@@ -432,6 +444,8 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     Dynarmic::HaltReason halt_reason;
+
+    cb->reset_ticks();
 
     do {
         halt_reason = jit->Run();
