@@ -1,80 +1,110 @@
-# Workflow simplifié pour builder Vita3K pour Windows
-# À placer dans .github/workflows/build-windows.yml de votre fork
-#
-# Workflow : vous éditez sur le Raspi → git push → GitHub compile pour Windows
-# → vous téléchargez le .exe depuis l'onglet Actions
+# Workflow pour builder Vita3K pour Windows ET macOS
+# À placer dans .github/workflows/build-windows-macos.yml de votre fork
 
-name: Build Vita3K Windows
+name: Build Vita3K Windows & macOS
 
 on:
   push:
     branches: [master]
   pull_request:
     branches: [master]
-  # Permet de lancer le build manuellement depuis l'onglet Actions
   workflow_dispatch:
 
-jobs:
-  build-windows:
-    runs-on: windows-latest
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-    env:
-      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows (Ninja + MSVC) ──
+          - os: windows-latest
+            name: Windows
+            configure_preset: windows-ninja
+            build_preset: windows-ninja-relwithdebinfo
+            artifact_path: build/windows-ninja/bin/RelWithDebInfo/
+
+          # ── macOS (Ninja + AppleClang) ──
+          - os: macos-latest
+            name: macOS
+            configure_preset: macos-ninja
+            build_preset: macos-ninja-relwithdebinfo
+            artifact_path: build/macos-ninja/bin/RelWithDebInfo/
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
 
     steps:
-      # 1. Checkout du code avec tous les sous-modules
+      # ── Checkout ──
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      # 2. Setup vcpkg et installation des dépendances
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: 'a7b6122f6b6504d16d96117336a0562693579933'
+      # ── SHA court ──
+      - name: Get short SHA
+        id: sha
+        shell: bash
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Install vcpkg dependencies
-        run: >
-          vcpkg install
-          zlib:x64-windows-static-md
-          boost-system:x64-windows-static-md
-          boost-filesystem:x64-windows-static-md
-          boost-program-options:x64-windows-static-md
-          boost-icl:x64-windows-static-md
-          boost-variant:x64-windows-static-md
-          curl:x64-windows-static-md
-          openssl:x64-windows-static-md
+      # ── Windows : installer vcpkg + dépendances ──
+      - name: Install vcpkg and dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+          ./vcpkg/vcpkg install \
+            zlib:x64-windows-static-md \
+            boost-system:x64-windows-static-md \
+            boost-filesystem:x64-windows-static-md \
+            boost-program-options:x64-windows-static-md \
+            boost-icl:x64-windows-static-md \
+            boost-variant:x64-windows-static-md \
+            curl:x64-windows-static-md \
+            openssl:x64-windows-static-md
 
-      # 3. Setup ccache pour accélérer les rebuilds
+      # ── macOS : installer dépendances ──
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install boost cmake ninja ccache molten-vk
+
+      # ── ccache ──
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1
         with:
-          key: vita3k-windows-ninja
+          key: vita3k-${{ matrix.name }}
           max-size: 1G
 
-      # 4. Configure avec le preset CMake du projet
-      - name: CMake Configure
+      # ── Configure Windows ──
+      - name: CMake Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
         run: |
-          cmake --preset windows-ninja `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+          cmake --preset ${{ matrix.configure_preset }} \
+            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-      # 5. Build en RelWithDebInfo (bon compromis perf/debug)
+      # ── Configure macOS ──
+      - name: CMake Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake --preset ${{ matrix.configure_preset }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      # ── Build ──
       - name: CMake Build
-        run: cmake --build --preset windows-ninja-relwithdebinfo --parallel
+        run: cmake --build --preset ${{ matrix.build_preset }} --parallel
 
-      # 6. Récupérer le SHA court pour nommer l'artifact
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
-
-      # 7. Upload de l'exécutable comme artifact téléchargeable
+      # ── Upload artifact ──
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vita3k-windows-${{ steps.sha.outputs.short }}
-          path: build/windows-ninja/bin/RelWithDebInfo/
+          name: vita3k-${{ matrix.name }}-${{ steps.sha.outputs.short }}
+          path: ${{ matrix.artifact_path }}
           retention-days: 30
