@@ -1,0 +1,80 @@
+# Workflow simplifié pour builder Vita3K pour Windows
+# À placer dans .github/workflows/build-windows.yml de votre fork
+#
+# Workflow : vous éditez sur le Raspi → git push → GitHub compile pour Windows
+# → vous téléchargez le .exe depuis l'onglet Actions
+
+name: Build Vita3K Windows
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Permet de lancer le build manuellement depuis l'onglet Actions
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+
+    steps:
+      # 1. Checkout du code avec tous les sous-modules
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # 2. Setup vcpkg et installation des dépendances
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a7b6122f6b6504d16d96117336a0562693579933'
+
+      - name: Install vcpkg dependencies
+        run: >
+          vcpkg install
+          zlib:x64-windows-static-md
+          boost-system:x64-windows-static-md
+          boost-filesystem:x64-windows-static-md
+          boost-program-options:x64-windows-static-md
+          boost-icl:x64-windows-static-md
+          boost-variant:x64-windows-static-md
+          curl:x64-windows-static-md
+          openssl:x64-windows-static-md
+
+      # 3. Setup ccache pour accélérer les rebuilds
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: vita3k-windows-ninja
+          max-size: 1G
+
+      # 4. Configure avec le preset CMake du projet
+      - name: CMake Configure
+        run: |
+          cmake --preset windows-ninja `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      # 5. Build en RelWithDebInfo (bon compromis perf/debug)
+      - name: CMake Build
+        run: cmake --build --preset windows-ninja-relwithdebinfo --parallel
+
+      # 6. Récupérer le SHA court pour nommer l'artifact
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+
+      # 7. Upload de l'exécutable comme artifact téléchargeable
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vita3k-windows-${{ steps.sha.outputs.short }}
+          path: build/windows-ninja/bin/RelWithDebInfo/
+          retention-days: 30
