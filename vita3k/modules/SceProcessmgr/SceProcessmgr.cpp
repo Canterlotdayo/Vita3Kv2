@@ -110,7 +110,7 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_ERROR("  Thread: {} (ID: {})", tname, thread_id);
     LOG_ERROR("  Params: 0x{:X}, 0x{:X}", param1, param2);
     if (thread && thread->cpu) {
-        auto ctx = thread->cpu->save_context();
+        auto ctx = save_context(*thread->cpu);
         LOG_ERROR("  CPU context:\n{}", ctx.description());
     }
     LOG_ERROR("============================");

@@ -1112,7 +1112,7 @@ EXPORT(int, sceKernelCallModuleExit) {
     LOG_INFO("=== MODULE EXIT CALLED ===");
     LOG_INFO("  Thread: {} (ID: {})", tname, thread_id);
     if (thread && thread->cpu) {
-        auto ctx = thread->cpu->save_context();
+        auto ctx = save_context(*thread->cpu);
         LOG_INFO("  CPU context:\n{}", ctx.description());
     }
     LOG_INFO("==========================");
