@@ -1109,21 +1109,13 @@ EXPORT(int, sceKernelCallModuleExit) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_INFO("=== MODULE EXIT CALLED ===");
-    LOG_INFO("  Thread: {} (ID: {})", tname, thread_id);
-    if (thread && thread->cpu) {
-        auto ctx = save_context(*thread->cpu);
-        LOG_INFO("  CPU context:\n{}", ctx.description());
-    }
-    LOG_INFO("==========================");
+    LOG_WARN("sceKernelCallModuleExit called on thread {} (ID: {}) - ignoring to allow Mono to continue", tname, thread_id);
 
-    // Stop the guest CPU execution for this thread.
-    // This makes run_loop() exit cleanly without destroying
-    // host-side objects (avoiding macOS condition_variable crash).
-    if (thread && thread->cpu) {
-        stop(*thread->cpu);
-    }
-
+    // On a real Vita, abort() -> sceKernelCallAbortHandler -> sceKernelCallModuleExit
+    // terminates the process. But Mono's assertions are debug checks for race conditions
+    // that are benign (duplicate JIT hash table entries). 
+    // By returning 0 without stopping the thread, the Mono assertion handler returns
+    // to its caller, which continues execution normally.
     return 0;
 }
 

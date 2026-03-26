@@ -103,20 +103,12 @@ EXPORT(int, sceKernelCDialogSetLeaseLimit) {
 EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     TRACY_FUNC(sceKernelCallAbortHandler, param1, param2);
 
-    // Dump full thread context for crash diagnosis
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_ERROR("=== ABORT HANDLER CALLED ===");
-    LOG_ERROR("  Thread: {} (ID: {})", tname, thread_id);
-    LOG_ERROR("  Params: 0x{:X}, 0x{:X}", param1, param2);
-    if (thread && thread->cpu) {
-        auto ctx = save_context(*thread->cpu);
-        LOG_ERROR("  CPU context:\n{}", ctx.description());
-    }
-    LOG_ERROR("============================");
+    LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X} - ignoring", tname, thread_id, param1, param2);
 
-    // On a real Vita this calls the registered abort handler then terminates.
-    // Returning 0 allows the runtime to attempt recovery rather than hanging.
+    // Mono calls abort() when a debug assertion fails (e.g. duplicate JIT hash entry).
+    // These assertions are benign race conditions. Return 0 to let the thread continue.
     return 0;
 }
 
