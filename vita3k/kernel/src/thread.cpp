@@ -260,26 +260,27 @@ bool ThreadState::run_loop() {
             }
 
             // Mono thread serialization.
-            // Mono's mono_class_init uses a non-atomic check+write pattern that
-            // is safe on real Vita (threads on same core are time-sliced, never
-            // parallel) but races on Vita3K (true parallelism). When multiple
-            // Mono worker threads init the same class simultaneously, Mono calls
-            // abort(). Fix: serialize execution of Mono-named threads with a
-            // single mutex. Non-Mono threads run freely with no overhead.
             //
-            // The mutex is held during each run() call (one quantum). Between
-            // quanta and around SVCs, the mutex is released so other Mono threads
-            // can run. The quantum (333k cycles ≈ 1ms) is large enough to cover
-            // any non-atomic check+write pattern in Mono (which is ~20 instructions).
+            // On the real Vita, threads on the same core never run in parallel.
+            // Mono relies on this: mono_class_init uses a non-atomic check+write
+            // that races under true parallelism. Fix: serialize all Mono-named
+            // threads with a mutex, held for the entire execution loop.
+            //
+            // With cycle counting disabled, run() only returns on SVC or halt —
+            // exactly like the real Vita. The mutex is released around SVC handlers
+            // (which may block on sync primitives), then re-acquired. This way:
+            // - No race: only one Mono thread executes guest code at a time
+            // - No deadlock: blocked SVCs release the mutex so others can proceed
+            // - No overhead: cycle counting is off, full Dynarmic speed
             {
             const bool is_mono_thread = (name.find("Mono") != std::string::npos);
 
+            if (is_mono_thread) {
+                kernel.mono_thread_mutex.lock();
+            }
+
             // Run the cpu
             do {
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.lock();
-                }
-
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
@@ -287,15 +288,21 @@ bool ThreadState::run_loop() {
                     res = run(*cpu);
                 }
 
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.unlock();
-                }
-
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
+                    if (is_mono_thread) {
+                        kernel.mono_thread_mutex.unlock();
+                    }
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
+                    if (is_mono_thread) {
+                        kernel.mono_thread_mutex.lock();
+                    }
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
+
+            if (is_mono_thread) {
+                kernel.mono_thread_mutex.unlock();
+            }
             } // end mono serialization block
 
             lock.lock();
