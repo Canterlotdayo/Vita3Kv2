@@ -267,21 +267,19 @@ bool ThreadState::run_loop() {
             // abort(). Fix: serialize execution of Mono-named threads with a
             // single mutex. Non-Mono threads run freely with no overhead.
             //
-            // The mutex is held for the ENTIRE do-while loop (across multiple
-            // quanta), not just one run() call. This prevents races that span
-            // multiple quanta (read in quantum N, write in quantum N+1).
-            // The mutex is released around SVC handlers because SVCs may block
-            // (semaphore wait, delay, etc.) and we don't want to hold the mutex
-            // while sleeping. After the SVC returns, the mutex is re-acquired.
+            // The mutex is held during each run() call (one quantum). Between
+            // quanta and around SVCs, the mutex is released so other Mono threads
+            // can run. The quantum (333k cycles ≈ 1ms) is large enough to cover
+            // any non-atomic check+write pattern in Mono (which is ~20 instructions).
             {
             const bool is_mono_thread = (name.find("Mono") != std::string::npos);
 
-            if (is_mono_thread) {
-                kernel.mono_thread_mutex.lock();
-            }
-
             // Run the cpu
             do {
+                if (is_mono_thread) {
+                    kernel.mono_thread_mutex.lock();
+                }
+
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
@@ -289,23 +287,15 @@ bool ThreadState::run_loop() {
                     res = run(*cpu);
                 }
 
+                if (is_mono_thread) {
+                    kernel.mono_thread_mutex.unlock();
+                }
+
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
-                    // Release mutex during SVC — the handler may block (semaphore
-                    // wait, delay, etc.) and we must not hold the mutex while sleeping.
-                    if (is_mono_thread) {
-                        kernel.mono_thread_mutex.unlock();
-                    }
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
-                    if (is_mono_thread) {
-                        kernel.mono_thread_mutex.lock();
-                    }
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
-
-            if (is_mono_thread) {
-                kernel.mono_thread_mutex.unlock();
-            }
             } // end mono serialization block
 
             lock.lock();

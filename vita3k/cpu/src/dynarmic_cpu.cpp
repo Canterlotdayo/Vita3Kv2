@@ -409,7 +409,7 @@ public:
     // Scheduling quantum: ~1ms at 333MHz Vita clock.
     // Dynarmic returns from run() when ticks reach 0, giving other threads
     // a chance to acquire the Mono serialization mutex.
-    static constexpr int64_t QUANTUM = 333000;
+    static constexpr int64_t QUANTUM = 10000000;
     int64_t ticks_remaining = QUANTUM;
 
     void reset_ticks() {
