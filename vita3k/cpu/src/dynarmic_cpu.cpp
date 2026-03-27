@@ -117,7 +117,10 @@ public:
             // to the C# exception handler and resume us.
             if (parent->protocol &&
                 parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
-                // Thread has been suspended. Return NOP so Dynarmic exits cleanly.
+                // Thread has been suspended. Halt execution immediately so Dynarmic
+                // doesn't continue processing the current basic block (which would
+                // trigger more MemoryReadCode/MemoryRead callbacks on null addresses).
+                cpu->jit->HaltExecution();
                 return 0xE320F000;
             }
 
