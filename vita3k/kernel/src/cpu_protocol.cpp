@@ -20,6 +20,7 @@
 #include <cpu/functions.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
+#include <util/log.h>
 
 CPUProtocol::CPUProtocol(KernelState &kernel, MemState &mem, const CallImportFunc &func)
     : call_import(func)
