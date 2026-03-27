@@ -664,7 +664,11 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         if (infoCpu->size != sizeof(*infoCpu))
             return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
 
-        // Todo
+        CPUContext ctx = save_context(*thread->cpu);
+        memcpy(ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
+        ctx.cpsr = infoCpu->cpsr;
+        load_context(*thread->cpu, ctx);
+        write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
     }
 
     SceKernelThreadVfpRegisterInfo *infoVfp = pVfpRegisterInfo.get(emuenv.mem);
@@ -672,10 +676,13 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         if (infoVfp->size != sizeof(*infoVfp))
             return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
 
-        // Todo
+        CPUContext ctx = save_context(*thread->cpu);
+        memcpy(ctx.fpu_registers.data(), infoVfp->reg, 64 * 4);
+        ctx.fpscr = infoVfp->fpscr;
+        load_context(*thread->cpu, ctx);
     }
 
-    return UNIMPLEMENTED();
+    return SCE_KERNEL_OK;
 }
 
 EXPORT(int, _sceKernelSetTimerEvent) {
