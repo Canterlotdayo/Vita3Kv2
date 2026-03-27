@@ -265,12 +265,20 @@ bool ThreadState::run_loop() {
             // Only one thread runs per core at a time. We emulate this:
             //
             // - Threads with explicit single-core affinity are scheduled.
+            // - Mono threads are ALWAYS scheduled (on core 0 if no explicit
+            //   single-core affinity) to prevent race conditions in mono_class_init.
             // - A background timer thread calls halt_execution() every ~1ms
             //   on the active thread, forcing run() to return (preemption).
             // - No cycle counting = zero JIT overhead.
-            // - Threads with default/multi-core affinity run freely.
+            // - Other threads with default/multi-core affinity run freely.
             {
-            const int sched_core = KernelState::affinity_to_core(affinity_mask);
+            int sched_core = KernelState::affinity_to_core(affinity_mask);
+            const bool is_mono = (name.find("Mono") != std::string::npos);
+            // Mono threads must be serialized to prevent race conditions.
+            // If they don't have a single-core affinity, put them on core 0.
+            if (is_mono && sched_core < 0) {
+                sched_core = 0;
+            }
             const bool is_scheduled = (sched_core >= 0);
 
             // Get shared_ptr to ourselves for the timer thread to access
