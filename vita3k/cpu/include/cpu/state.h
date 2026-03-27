@@ -37,4 +37,9 @@ struct CPUState {
     CPUInterfacePtr cpu;
     bool svc_called;
     uint32_t svc;
+
+    // When true, this thread uses cycle-counted scheduling (quantum-based preemption).
+    // Set for Mono threads that need serialization to prevent race conditions.
+    // When false, the thread runs at full speed with no tick overhead.
+    bool use_mono_scheduling = false;
 };

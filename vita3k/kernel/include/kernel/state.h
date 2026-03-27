@@ -17,29 +17,191 @@
 
 #pragma once
 
-#include <cpu/common.h>
-#include <cpu/disasm/state.h>
-#include <mem/block.h>
-#include <mem/state.h>
+#include <kernel/callback.h>
+#include <kernel/cpu_protocol.h>
+#include <kernel/debugger.h>
+#include <kernel/object_store.h>
+#include <kernel/sync_primitives.h>
+#include <kernel/types.h>
+#include <mem/allocator.h>
+#include <mem/ptr.h>
+#include <mem/util.h>
+#include <rtc/rtc.h>
+#include <util/containers.h>
 #include <util/types.h>
 
-struct CPUState {
-    CPUState() = default;
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <vector>
 
-    SceUID thread_id = 0;
-    MemState *mem = nullptr;
-    CPUProtocolBase *protocol = nullptr;
-    DisasmState disasm;
+struct ThreadState;
 
-    Block halt_instruction;
-    Address halt_instruction_pc; // thumb mode pc
+struct SDL_Thread;
 
-    CPUInterfacePtr cpu;
-    bool svc_called;
-    uint32_t svc;
+struct CodecEngineBlock;
 
-    // When true, this thread uses cycle-counted scheduling (quantum-based preemption).
-    // Set for Mono threads that need serialization to prevent race conditions.
-    // When false, the thread runs at full speed with no tick overhead.
-    bool use_mono_scheduling = false;
+struct KernelModule {
+    SceKernelModuleInfo info;
+    Ptr<const uint8_t> info_segment_address;
+    uint32_t info_offset;
+};
+typedef std::shared_ptr<KernelModule> SceKernelModulePtr;
+
+typedef std::shared_ptr<ThreadState> ThreadStatePtr;
+typedef std::map<SceUID, CodecEngineBlock> CodecEngineBlocks;
+typedef std::map<SceUID, Ptr<Ptr<void>>> SlotToAddress;
+typedef std::map<SceUID, ThreadStatePtr> ThreadStatePtrs;
+typedef std::shared_ptr<SDL_Thread> ThreadPtr;
+typedef std::map<SceUID, ThreadPtr> ThreadPtrs;
+typedef std::map<SceUID, SceKernelModulePtr> SceKernelModuleInfoPtrs;
+typedef std::map<SceUID, CallbackPtr> CallbackPtrs;
+typedef unordered_map_fast<uint32_t, Address> ExportNids;
+
+typedef std::map<Address, uint32_t> NotFoundVars;
+typedef std::unique_ptr<CPUProtocol> CPUProtocolPtr;
+
+struct CodecEngineBlock {
+    uint32_t size;
+    int32_t vaddr;
+};
+
+using LoadedSysmodules = std::map<SceSysmoduleModuleId, std::vector<SceUID>>;
+using LoadedInternalSysmodules = std::vector<SceSysmoduleInternalModuleId>;
+
+struct CorenumAllocator {
+    BitmapAllocator alloc;
+    std::mutex lock;
+
+    void set_max_core_count(const std::size_t max);
+
+    int new_corenum();
+    void free_corenum(const int num);
+};
+
+struct VarBindingInfo {
+    void *entries;
+    uint32_t size;
+    uint32_t module_nid;
+};
+
+typedef std::multimap<uint32_t, VarBindingInfo> VarBindingInfos;
+typedef std::multimap<uint32_t, Address> FuncBindingInfos;
+
+typedef std::map<uint32_t, uint32_t> ModuleUidByNid;
+
+struct KernelState {
+    KernelState();
+
+    std::mutex mutex;
+    CodecEngineBlocks codec_blocks;
+
+    Ptr<const void> tls_address = Ptr<const void>(0);
+    unsigned int tls_psize = 0;
+    unsigned int tls_msize = 0;
+
+    Ptr<const void> thread_event_start = Ptr<const void>(0);
+    Address thread_event_start_arg = 0;
+    Ptr<const void> thread_event_end = Ptr<const void>(0);
+    Address thread_event_end_arg = 0;
+
+    SimpleEventPtrs simple_events;
+    TimerPtrs timers;
+    SemaphorePtrs semaphores;
+    CondvarPtrs condvars;
+    CondvarPtrs lwcondvars;
+    MutexPtrs mutexes;
+    MutexPtrs lwmutexes; // also Mutexes for now
+    RWLockPtrs rwlocks;
+    EventFlagPtrs eventflags;
+    MsgPipePtrs msgpipes;
+    CallbackPtrs callbacks;
+
+    ThreadStatePtrs threads;
+    void *jni_env;
+    void *jni_activity;
+
+    SceKernelModuleInfoPtrs loaded_modules;
+    LoadedSysmodules loaded_sysmodules;
+    LoadedInternalSysmodules loaded_internal_sysmodules;
+
+    // the variables in this block must be accessed by first locking export_nids_mutex
+    std::mutex export_nids_mutex;
+    ExportNids export_nids;
+    FuncBindingInfos func_binding_infos;
+    VarBindingInfos var_binding_infos;
+    ModuleUidByNid module_uid_by_nid;
+
+    bool cpu_opt;
+    CorenumAllocator corenum_allocator;
+    CPUProtocolPtr cpu_protocol;
+    ExclusiveMonitorPtr exclusive_monitor;
+
+    ObjectStore obj_store;
+
+    // Mono JIT race condition workaround:
+    // Store the address range of mono-vita.suprx code segment so we can detect
+    // when abort() is called from Mono code (due to benign hash table assertion
+    // caused by concurrent JIT compilation on multiple threads).
+    Address mono_code_start = 0;
+    Address mono_code_end = 0;
+
+    // Per-core scheduling: on the real Vita, threads with the same CPU affinity
+    // share a core and are time-sliced (never truly parallel). Vita3K runs each
+    // guest thread on its own host thread, causing true parallelism and race
+    // conditions in guest code that assumes single-core cooperative scheduling.
+    // These mutexes + cycle-limited execution emulate per-core time slicing.
+    static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
+    // Serializes Mono worker thread execution to prevent race conditions
+    // in mono_class_init. Only threads named "Mono" acquire this mutex.
+    std::mutex mono_thread_mutex;
+
+    // Mono exception handler mechanism:
+    // On real Vita, when a thread hits a null pointer / illegal access, the kernel
+    // converts the hardware fault into a signal that wakes the Mono exception handler
+    // thread via sceKernelWaitExceptionForMono(). The exception handler then suspends
+    // the faulting thread, reads/modifies its CPU context (to redirect PC to the C#
+    // exception handler), and resumes it.
+    //
+    // In Vita3K, Dynarmic doesn't generate real hardware faults. Instead, MemoryReadCode
+    // and MemoryRead detect null accesses. We signal the exception handler thread here
+    // and suspend the faulting thread until Mono processes the exception.
+    std::mutex mono_exception_mutex;
+    bool mono_exception_pending = false;
+    SceUID mono_exception_handler_thread = 0;  // thread ID of ExceptionHandlerThread
+    SceUID mono_exception_sema = 0;            // semaphore to block ExceptionHandlerThread
+    SceUID mono_exception_thread_id = 0;       // faulting thread ID
+    Address mono_exception_fault_addr = 0;     // address that caused the fault
+    Address mono_exception_fault_pc = 0;       // PC at time of fault
+
+    uint64_t start_tick;
+    SceRtcTick base_tick;
+    Ptr<SceProcessParam> process_param;
+
+    Debugger debugger;
+
+    SceUID get_next_uid() {
+        return next_uid++;
+    }
+
+    bool init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt);
+    void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
+    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
+    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
+
+    ThreadStatePtr get_thread(SceUID thread_id);
+    Ptr<Ptr<void>> get_thread_tls_addr(MemState &mem, SceUID thread_id, int key);
+
+    void exit_delete_all_threads();
+    bool is_threads_paused() { return !paused_threads_status.empty(); }
+    void pause_threads();
+    void resume_threads();
+
+    void set_memory_watch(bool enabled);
+    void invalidate_jit_cache(Address start, size_t length);
+    SceKernelModuleInfo *find_module_by_addr(Address address);
+
+private:
+    std::atomic<SceUID> next_uid{ 1 };
+    std::map<SceUID, ThreadStatus> paused_threads_status;
 };
