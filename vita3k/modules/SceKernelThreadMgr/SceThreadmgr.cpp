@@ -432,7 +432,6 @@ EXPORT(int, _sceKernelGetSystemTime) {
 
 EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo, Ptr<SceKernelThreadVfpRegisterInfo> pVfpRegisterInfo) {
     TRACY_FUNC(_sceKernelGetThreadContextForVM, threadId, pCpuRegisterInfo, pVfpRegisterInfo);
-    STUBBED("Stub");
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(threadId);
     if (!thread)
@@ -446,6 +445,22 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
 
         infoCpu->cpsr = context.cpsr;
         memcpy(infoCpu->reg, context.cpu_registers.data(), 16 * 4);
+
+        // If this is the Mono faulting thread, override PC with the saved fault PC.
+        // After signal_mono_exception, the thread continues executing in the JIT block
+        // (returning NOPs and 0s) before run() returns. The PC read from the CPU state
+        // is corrupted — it's wherever Dynarmic left off, not the faulting instruction.
+        // On the real Vita, the thread stops immediately at the fault. We emulate this
+        // by restoring the saved fault PC so the Mono callback can properly redirect it.
+        {
+            std::lock_guard<std::mutex> mlock(emuenv.kernel.mono_exception_mutex);
+            if (emuenv.kernel.mono_exception_thread_id == threadId) {
+                infoCpu->reg[15] = emuenv.kernel.mono_exception_fault_pc;
+                LOG_WARN("GetThreadContextForVM: overriding PC for faulting thread {} to saved fault PC 0x{:08X}",
+                         threadId, emuenv.kernel.mono_exception_fault_pc);
+            }
+        }
+
         infoCpu->sb = 100000; // Todo
         infoCpu->st = 100000; // Todo
         infoCpu->teehbr = 100000; // Todo
@@ -664,10 +679,15 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         if (infoCpu->size != sizeof(*infoCpu))
             return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
 
-        CPUContext ctx = save_context(*thread->cpu);
-        memcpy(ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
-        ctx.cpsr = infoCpu->cpsr;
-        load_context(*thread->cpu, ctx);
+        CPUContext old_ctx = save_context(*thread->cpu);
+        uint32_t old_pc = old_ctx.cpu_registers[15];
+        uint32_t new_pc = infoCpu->reg[15];
+        LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
+                 threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
+
+        memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
+        old_ctx.cpsr = infoCpu->cpsr;
+        load_context(*thread->cpu, old_ctx);
         write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
     }
 
