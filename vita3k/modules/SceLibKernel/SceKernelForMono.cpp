@@ -21,6 +21,7 @@
 #include <cpu/functions.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
+#include <kernel/thread/thread_state.h>
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceKernelForMono);
 
@@ -44,15 +45,11 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
     return CALL_EXPORT(sceKernelSuspendThreadForVM, threadId);
 }
 
-EXPORT(int, sceKernelWaitExceptionForMono) {
-    TRACY_FUNC(sceKernelWaitExceptionForMono);
+EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int flags) {
+    TRACY_FUNC(sceKernelWaitExceptionForMono, type, pInfo, flags);
 
     LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
 
-    // Create a semaphore if we don't have one yet, then wait on it.
-    // This properly blocks the guest thread within the kernel threading model.
-    // When a null pointer fault is detected, signal_mono_exception() will
-    // signal this semaphore to wake us up.
     {
         std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
         emuenv.kernel.mono_exception_handler_thread = thread_id;
@@ -64,22 +61,58 @@ EXPORT(int, sceKernelWaitExceptionForMono) {
         }
     }
 
-    // Block on the semaphore - this is a proper guest-level wait that suspends
-    // the thread correctly within the run_loop mechanism.
     SceUID sema = emuenv.kernel.mono_exception_sema;
     semaphore_wait(emuenv.kernel, export_name, thread_id, sema, 1, nullptr);
 
-    // When we wake up, the exception info is in KernelState
-    std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
-    SceUID faulting_tid = emuenv.kernel.mono_exception_thread_id;
-    Address fault_addr = emuenv.kernel.mono_exception_fault_addr;
-    Address fault_pc = emuenv.kernel.mono_exception_fault_pc;
-    emuenv.kernel.mono_exception_pending = false;
+    SceUID faulting_tid;
+    Address fault_addr;
+    Address fault_pc;
+    {
+        std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+        faulting_tid = emuenv.kernel.mono_exception_thread_id;
+        fault_addr = emuenv.kernel.mono_exception_fault_addr;
+        fault_pc = emuenv.kernel.mono_exception_fault_pc;
+        emuenv.kernel.mono_exception_pending = false;
+    }
+
+    // Wait for the faulting thread to actually reach suspend state
+    auto faulting_thread = emuenv.kernel.get_thread(faulting_tid);
+    if (faulting_thread) {
+        for (int i = 0; i < 1000; i++) {
+            {
+                std::lock_guard<std::mutex> tlock(faulting_thread->mutex);
+                if (faulting_thread->status == ThreadStatus::suspend ||
+                    faulting_thread->status == ThreadStatus::wait ||
+                    faulting_thread->status == ThreadStatus::dormant) {
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+
+    // Write exception info into the output structure.
+    // The structure layout (from Ghidra disassembly):
+    //   +0x00: size (set by caller to 0x18 = 24 bytes)
+    //   +0x04: faulting thread ID
+    //   +0x08: fault address
+    //   +0x0C: fault PC
+    //   +0x10: exception type
+    //   +0x14: reserved
+    if (pInfo) {
+        uint32_t *info = pInfo.get(emuenv.mem);
+        // info[0] = size, already set by caller (0x18)
+        info[1] = static_cast<uint32_t>(faulting_tid);
+        info[2] = fault_addr;
+        info[3] = fault_pc;
+        info[4] = 0x101;  // exception type (same as the type parameter)
+        info[5] = 0;
+    }
 
     LOG_WARN("sceKernelWaitExceptionForMono: woke up! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
              faulting_tid, fault_addr, fault_pc);
 
-    return faulting_tid;
+    return SCE_KERNEL_OK;
 }
 
 EXPORT(int, sceKernelWaitExceptionCBForMono) {
