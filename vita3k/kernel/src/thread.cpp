@@ -266,6 +266,7 @@ bool ThreadState::run_loop() {
             // Mono worker threads init the same class simultaneously, Mono calls
             // abort(). Fix: serialize execution of Mono-named threads with a
             // single mutex. Non-Mono threads run freely with no overhead.
+            {
             const bool is_mono_thread = (name.find("Mono") != std::string::npos);
 
             // Run the cpu
@@ -290,6 +291,7 @@ bool ThreadState::run_loop() {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
+            } // end mono serialization block
 
             lock.lock();
 
