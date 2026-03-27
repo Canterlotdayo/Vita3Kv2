@@ -26,10 +26,11 @@
 
 struct MemState;
 
-CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol, bool enable_scheduling = false);
+CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol);
 int run(CPUState &state);
 int step(CPUState &state);
 void stop(CPUState &state);
+void halt_execution(CPUState &state);
 void set_thread_id(CPUState &state, SceUID thread_id);
 SceUID get_thread_id(CPUState &state);
 uint32_t read_reg(CPUState &state, size_t index);

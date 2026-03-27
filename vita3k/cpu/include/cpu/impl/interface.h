@@ -27,6 +27,8 @@ struct CPUInterface {
 
     virtual int run() = 0;
     virtual void stop() = 0;
+    // Thread-safe: can be called from any thread to force run() to return
+    virtual void halt_execution() = 0;
 
     virtual uint32_t get_reg(uint8_t idx) = 0;
     virtual void set_reg(uint8_t idx, uint32_t val) = 0;

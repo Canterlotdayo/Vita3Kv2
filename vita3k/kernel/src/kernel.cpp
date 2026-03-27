@@ -99,16 +99,44 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     cpu_protocol = std::make_unique<CPUProtocol>(*this, mem, call_import);
     this->cpu_opt = cpu_opt;
 
+    start_preemption_timer();
+
     return true;
 }
 
+void KernelState::start_preemption_timer() {
+    preemption_timer_running = true;
+    preemption_timer_thread = std::thread([this]() {
+        while (preemption_timer_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+            for (int core = 0; core < NUM_CORES; core++) {
+                std::lock_guard<std::mutex> lock(core_sched_mutex[core]);
+                auto thread = core_active_thread[core];
+                if (thread && thread->cpu) {
+                    halt_execution(*thread->cpu);
+                }
+            }
+        }
+    });
+}
+
+void KernelState::stop_preemption_timer() {
+    preemption_timer_running = false;
+    if (preemption_timer_thread.joinable()) {
+        preemption_timer_thread.join();
+    }
+}
+
 int KernelState::affinity_to_core(SceInt32 affinity_mask) {
-    if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
-        return -1; // default affinity = no scheduling
-    if (affinity_mask & 0x10000) return 0;
-    if (affinity_mask & 0x20000) return 1;
-    if (affinity_mask & 0x40000) return 2;
-    return -1;
+    // Only schedule threads with a single-core affinity.
+    // Multi-core masks (0x30000, 0x70000, etc.) and default (0) run freely.
+    switch (affinity_mask) {
+    case 0x10000: return 0;
+    case 0x20000: return 1;
+    case 0x40000: return 2;
+    default: return -1;
+    }
 }
 
 void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {

@@ -1,0 +1,326 @@
+diff --git a/vita3k/cpu/include/cpu/functions.h b/vita3k/cpu/include/cpu/functions.h
+index ef6c74f..340506b 100644
+--- a/vita3k/cpu/include/cpu/functions.h
++++ b/vita3k/cpu/include/cpu/functions.h
+@@ -26,10 +26,11 @@
+ 
+ struct MemState;
+ 
+-CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol, bool enable_scheduling = false);
++CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol);
+ int run(CPUState &state);
+ int step(CPUState &state);
+ void stop(CPUState &state);
++void halt_execution(CPUState &state);
+ void set_thread_id(CPUState &state, SceUID thread_id);
+ SceUID get_thread_id(CPUState &state);
+ uint32_t read_reg(CPUState &state, size_t index);
+@@ -70,4 +71,4 @@ void trigger_breakpoint(CPUState &state);
+ void set_log_code(CPUState &state, bool log);
+ void set_log_mem(CPUState &state, bool log);
+ bool get_log_code(CPUState &state);
+-bool get_log_mem(CPUState &state);
+\ No newline at end of file
++bool get_log_mem(CPUState &state);
+diff --git a/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h b/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h
+index 696887e..8b64db3 100644
+--- a/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h
++++ b/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h
+@@ -54,6 +54,7 @@ public:
+     ~DynarmicCPU() override;
+     int run() override;
+     void stop() override;
++    void halt_execution() override;
+ 
+     uint32_t get_reg(uint8_t idx) override;
+     void set_reg(uint8_t idx, uint32_t val) override;
+diff --git a/vita3k/cpu/include/cpu/impl/interface.h b/vita3k/cpu/include/cpu/impl/interface.h
+index 6be49bc..63354fb 100644
+--- a/vita3k/cpu/include/cpu/impl/interface.h
++++ b/vita3k/cpu/include/cpu/impl/interface.h
+@@ -27,6 +27,8 @@ struct CPUInterface {
+ 
+     virtual int run() = 0;
+     virtual void stop() = 0;
++    // Thread-safe: can be called from any thread to force run() to return
++    virtual void halt_execution() = 0;
+ 
+     virtual uint32_t get_reg(uint8_t idx) = 0;
+     virtual void set_reg(uint8_t idx, uint32_t val) = 0;
+diff --git a/vita3k/cpu/src/cpu.cpp b/vita3k/cpu/src/cpu.cpp
+index 3bf024f..d4cc023 100644
+--- a/vita3k/cpu/src/cpu.cpp
++++ b/vita3k/cpu/src/cpu.cpp
+@@ -38,12 +38,11 @@ SceUID get_thread_id(CPUState &state) {
+     return state.thread_id;
+ }
+ 
+-CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol, bool enable_scheduling) {
++CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol) {
+     CPUStatePtr state(new CPUState(), delete_cpu_state);
+     state->mem = &mem;
+     state->protocol = protocol;
+     state->thread_id = thread_id;
+-    state->use_mono_scheduling = enable_scheduling;
+ 
+     // TODO: we can move this to kernel after we drop unicorn
+     // unicorn is unable to detect whether the exit was because of halt or not
+@@ -75,6 +74,10 @@ void stop(CPUState &state) {
+     state.cpu->stop();
+ }
+ 
++void halt_execution(CPUState &state) {
++    state.cpu->halt_execution();
++}
++
+ uint32_t read_reg(CPUState &state, size_t index) {
+     return state.cpu->get_reg(index);
+ }
+@@ -205,4 +208,4 @@ uint32_t stack_free(CPUState &state, size_t size) {
+     const uint32_t new_sp = read_sp(state) + size;
+     write_sp(state, new_sp);
+     return new_sp;
+-}
+\ No newline at end of file
++}
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index 53c81a5..1f0d19c 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -398,19 +398,10 @@ public:
+         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
+     }
+ 
+-    void AddTicks(uint64_t ticks) override {
+-        ticks_remaining -= static_cast<int64_t>(ticks);
+-    }
++    void AddTicks(uint64_t ticks) override {}
+ 
+     uint64_t GetTicksRemaining() override {
+-        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
+-    }
+-
+-    static constexpr int64_t SCHED_QUANTUM = 333000; // ~1ms at 333MHz
+-    int64_t ticks_remaining = SCHED_QUANTUM;
+-
+-    void reset_ticks() {
+-        ticks_remaining = SCHED_QUANTUM;
++        return 1ull << 60;
+     }
+ };
+ 
+@@ -425,10 +416,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
+         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
+     }
+     config.hook_hint_instructions = true;
+-    // Per-thread cycle counting: only threads with explicit CPU affinity
+-    // (scheduled threads) get cycle counting for quantum-based preemption.
+-    // Other threads run at full Dynarmic speed with no tick overhead.
+-    config.enable_cycle_counting = parent->use_mono_scheduling;
++    config.enable_cycle_counting = false;
+     config.global_monitor = monitor;
+     config.coprocessors[15] = cp15;
+     config.processor_id = core_id;
+@@ -455,7 +443,6 @@ int DynarmicCPU::run() {
+     exit_request = false;
+     parent->svc_called = false;
+     cb->mono_exception_signaled = false;
+-    cb->reset_ticks();
+     Dynarmic::HaltReason halt_reason;
+     do {
+         halt_reason = jit->Run();
+@@ -507,6 +494,10 @@ void DynarmicCPU::stop() {
+     exit_request = true;
+ }
+ 
++void DynarmicCPU::halt_execution() {
++    jit->HaltExecution();
++}
++
+ uint32_t DynarmicCPU::get_reg(uint8_t idx) {
+     return jit->Regs()[idx];
+ }
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index 7a35ed7..3c427ca 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -34,6 +34,7 @@
+ #include <condition_variable>
+ #include <map>
+ #include <mutex>
++#include <thread>
+ #include <vector>
+ 
+ struct ThreadState;
+@@ -154,26 +155,23 @@ struct KernelState {
+     // These mutexes + cycle-limited execution emulate per-core time slicing.
+     static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
+ 
+-    // Per-core preemptive scheduler.
+-    // On the real Vita, threads sharing a CPU core are time-sliced by priority.
+-    // Only one thread runs per core at a time. We emulate this for threads with
+-    // explicit CPU affinity (0x10000, 0x20000, 0x40000). Threads with default
+-    // affinity (0) run freely without scheduling overhead.
++    // Per-core preemptive scheduler with timer-based preemption.
+     //
+-    // Each core has a mutex + condvar. A thread wanting to run on a core:
+-    // 1. Locks core_sched_mutex[core]
+-    // 2. Sets itself as wanting to run
+-    // 3. Waits on core_sched_cv[core] until it's the highest-priority waiter
+-    //    and the core is free (core_active_thread[core] == 0)
+-    // 4. Sets core_active_thread[core] = its ID
+-    // 5. Unlocks mutex, runs guest code for one quantum
+-    // 6. Locks mutex, clears core_active_thread, notifies all waiters
+-    // 7. Repeats from step 3
++    // A background timer thread calls halt_execution() on the active thread
++    // of each core every ~1ms, forcing run() to return. This gives other
++    // threads a chance to acquire the core. No cycle counting needed.
++    //
++    // Only threads with explicit CPU affinity are scheduled. Threads with
++    // default affinity (0) run freely with zero overhead.
+     std::mutex core_sched_mutex[NUM_CORES];
+     std::condition_variable core_sched_cv[NUM_CORES];
+-    SceUID core_active_thread[NUM_CORES] = {0, 0, 0}; // thread ID currently running on each core
+-    
+-    // Get the core index for a given affinity mask. Returns -1 for default/any affinity.
++    std::shared_ptr<ThreadState> core_active_thread[NUM_CORES]; // currently running
++    std::atomic<bool> preemption_timer_running{false};
++    std::thread preemption_timer_thread;
++
++    void start_preemption_timer();
++    void stop_preemption_timer();
++
+     static int affinity_to_core(SceInt32 affinity_mask);
+ 
+     // Mono exception handler mechanism:
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index 50513ce..ae6c88f 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -99,16 +99,44 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
+     cpu_protocol = std::make_unique<CPUProtocol>(*this, mem, call_import);
+     this->cpu_opt = cpu_opt;
+ 
++    start_preemption_timer();
++
+     return true;
+ }
+ 
++void KernelState::start_preemption_timer() {
++    preemption_timer_running = true;
++    preemption_timer_thread = std::thread([this]() {
++        while (preemption_timer_running) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++
++            for (int core = 0; core < NUM_CORES; core++) {
++                std::lock_guard<std::mutex> lock(core_sched_mutex[core]);
++                auto thread = core_active_thread[core];
++                if (thread && thread->cpu) {
++                    halt_execution(*thread->cpu);
++                }
++            }
++        }
++    });
++}
++
++void KernelState::stop_preemption_timer() {
++    preemption_timer_running = false;
++    if (preemption_timer_thread.joinable()) {
++        preemption_timer_thread.join();
++    }
++}
++
+ int KernelState::affinity_to_core(SceInt32 affinity_mask) {
+-    if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
+-        return -1; // default affinity = no scheduling
+-    if (affinity_mask & 0x10000) return 0;
+-    if (affinity_mask & 0x20000) return 1;
+-    if (affinity_mask & 0x40000) return 2;
+-    return -1;
++    // Only schedule threads with a single-core affinity.
++    // Multi-core masks (0x30000, 0x70000, etc.) and default (0) run freely.
++    switch (affinity_mask) {
++    case 0x10000: return 0;
++    case 0x20000: return 1;
++    case 0x40000: return 2;
++    default: return -1;
++    }
+ }
+ 
+ void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 4df1c46..5bc3c29 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -73,8 +73,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+     start_tick = rtc_get_ticks(kernel.base_tick.tick);
+     last_vblank_waited = 0;
+ 
+-    const bool needs_scheduling = (name.find("Mono") != std::string::npos);
+-    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get(), needs_scheduling);
++    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get());
+     if (!cpu) {
+         return SCE_KERNEL_ERROR_ERROR;
+     }
+@@ -260,44 +259,36 @@ bool ThreadState::run_loop() {
+                 }
+             }
+ 
+-            // Per-core preemptive scheduler.
++            // Per-core preemptive scheduler with timer-based preemption.
+             //
+-            // On the real Vita, threads with explicit CPU affinity share a core
+-            // and are time-sliced by priority. Only one thread runs per core at
+-            // a time. We emulate this with per-core scheduling:
++            // On the real Vita, threads sharing a CPU core are time-sliced.
++            // Only one thread runs per core at a time. We emulate this:
+             //
+-            // - Threads with explicit affinity (0x10000/0x20000/0x40000) are
+-            //   scheduled on their core. Only the highest-priority thread runs;
+-            //   others wait on a condition variable.
+-            // - Threads with default affinity (0) run freely, no scheduling.
+-            // - Cycle counting is per-thread: scheduled threads get a 333k quantum,
+-            //   free threads get infinite ticks (no overhead).
+-            // - Between quanta, the running thread releases the core so others
+-            //   of equal or higher priority can run (preemption).
+-            // - SVCs release the core during blocking waits (semaphore, delay, etc.)
+-            //   to prevent deadlocks.
+-            //
+-            // This is not a full scheduler rewrite — it's a targeted serialization
+-            // that prevents the parallelism bugs while keeping the existing
+-            // thread-per-host-thread model intact.
++            // - Threads with explicit single-core affinity are scheduled.
++            // - A background timer thread calls halt_execution() every ~1ms
++            //   on the active thread, forcing run() to return (preemption).
++            // - No cycle counting = zero JIT overhead.
++            // - Threads with default/multi-core affinity run freely.
+             {
+-            const bool is_scheduled = (name.find("Mono") != std::string::npos);
+-            int sched_core = is_scheduled ? KernelState::affinity_to_core(affinity_mask) : -1;
+-            if (is_scheduled && sched_core < 0) sched_core = 0; // Mono with default affinity -> core 0
++            const int sched_core = KernelState::affinity_to_core(affinity_mask);
++            const bool is_scheduled = (sched_core >= 0);
++
++            // Get shared_ptr to ourselves for the timer thread to access
++            auto self = is_scheduled ? kernel.get_thread(id) : nullptr;
+ 
+             auto sched_acquire = [&]() {
+                 if (!is_scheduled) return;
+                 std::unique_lock<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
+                 kernel.core_sched_cv[sched_core].wait(slock, [&]() {
+-                    return kernel.core_active_thread[sched_core] == 0;
++                    return kernel.core_active_thread[sched_core] == nullptr;
+                 });
+-                kernel.core_active_thread[sched_core] = id;
++                kernel.core_active_thread[sched_core] = self;
+             };
+ 
+             auto sched_release = [&]() {
+                 if (!is_scheduled) return;
+                 std::lock_guard<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
+-                kernel.core_active_thread[sched_core] = 0;
++                kernel.core_active_thread[sched_core] = nullptr;
+                 kernel.core_sched_cv[sched_core].notify_all();
+             };
+ 
+

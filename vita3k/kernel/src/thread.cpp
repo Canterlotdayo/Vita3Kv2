@@ -73,8 +73,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
 
-    const bool needs_scheduling = (name.find("Mono") != std::string::npos);
-    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get(), needs_scheduling);
+    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get());
     if (!cpu) {
         return SCE_KERNEL_ERROR_ERROR;
     }
@@ -260,44 +259,36 @@ bool ThreadState::run_loop() {
                 }
             }
 
-            // Per-core preemptive scheduler.
+            // Per-core preemptive scheduler with timer-based preemption.
             //
-            // On the real Vita, threads with explicit CPU affinity share a core
-            // and are time-sliced by priority. Only one thread runs per core at
-            // a time. We emulate this with per-core scheduling:
+            // On the real Vita, threads sharing a CPU core are time-sliced.
+            // Only one thread runs per core at a time. We emulate this:
             //
-            // - Threads with explicit affinity (0x10000/0x20000/0x40000) are
-            //   scheduled on their core. Only the highest-priority thread runs;
-            //   others wait on a condition variable.
-            // - Threads with default affinity (0) run freely, no scheduling.
-            // - Cycle counting is per-thread: scheduled threads get a 333k quantum,
-            //   free threads get infinite ticks (no overhead).
-            // - Between quanta, the running thread releases the core so others
-            //   of equal or higher priority can run (preemption).
-            // - SVCs release the core during blocking waits (semaphore, delay, etc.)
-            //   to prevent deadlocks.
-            //
-            // This is not a full scheduler rewrite — it's a targeted serialization
-            // that prevents the parallelism bugs while keeping the existing
-            // thread-per-host-thread model intact.
+            // - Threads with explicit single-core affinity are scheduled.
+            // - A background timer thread calls halt_execution() every ~1ms
+            //   on the active thread, forcing run() to return (preemption).
+            // - No cycle counting = zero JIT overhead.
+            // - Threads with default/multi-core affinity run freely.
             {
-            const bool is_scheduled = (name.find("Mono") != std::string::npos);
-            int sched_core = is_scheduled ? KernelState::affinity_to_core(affinity_mask) : -1;
-            if (is_scheduled && sched_core < 0) sched_core = 0; // Mono with default affinity -> core 0
+            const int sched_core = KernelState::affinity_to_core(affinity_mask);
+            const bool is_scheduled = (sched_core >= 0);
+
+            // Get shared_ptr to ourselves for the timer thread to access
+            auto self = is_scheduled ? kernel.get_thread(id) : nullptr;
 
             auto sched_acquire = [&]() {
                 if (!is_scheduled) return;
                 std::unique_lock<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
                 kernel.core_sched_cv[sched_core].wait(slock, [&]() {
-                    return kernel.core_active_thread[sched_core] == 0;
+                    return kernel.core_active_thread[sched_core] == nullptr;
                 });
-                kernel.core_active_thread[sched_core] = id;
+                kernel.core_active_thread[sched_core] = self;
             };
 
             auto sched_release = [&]() {
                 if (!is_scheduled) return;
                 std::lock_guard<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
-                kernel.core_active_thread[sched_core] = 0;
+                kernel.core_active_thread[sched_core] = nullptr;
                 kernel.core_sched_cv[sched_core].notify_all();
             };
 

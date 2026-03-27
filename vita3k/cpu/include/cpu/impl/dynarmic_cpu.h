@@ -54,6 +54,7 @@ public:
     ~DynarmicCPU() override;
     int run() override;
     void stop() override;
+    void halt_execution() override;
 
     uint32_t get_reg(uint8_t idx) override;
     void set_reg(uint8_t idx, uint32_t val) override;
