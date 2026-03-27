@@ -1109,11 +1109,18 @@ EXPORT(int, sceKernelCallModuleExit) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - terminating thread", tname, thread_id);
 
-    // Kill the thread to prevent reaching sceKernelExitProcess.
-    // Normally the abort handler already redirected PC back to mono_class_init,
-    // so this should only be reached as a fallback.
+    // This is called during libc's abort() chain. On Mono threads, the abort
+    // is triggered by benign race conditions in class init (pending init).
+    // Killing the thread would corrupt Mono's runtime state and freeze the game.
+    // Instead, just return — the thread will unwind back through the abort chain
+    // and continue execution.
+    if (thread && thread->name.find("Mono") != std::string::npos) {
+        LOG_WARN("sceKernelCallModuleExit on Mono thread {} (ID: {}) - NOT killing, returning to let Mono continue", tname, thread_id);
+        return 0;
+    }
+
+    LOG_WARN("sceKernelCallModuleExit on thread {} (ID: {}) - terminating thread", tname, thread_id);
     if (thread) {
         thread->exit_delete(false);
     }
@@ -1301,6 +1308,16 @@ EXPORT(int, sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
 
 EXPORT(int, sceKernelExitProcess, int res) {
     TRACY_FUNC(sceKernelExitProcess, res);
+
+    // If called from a Mono thread, this is part of the abort() chain triggered
+    // by a benign class init race. Don't kill all threads — just ignore it.
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (thread && thread->name.find("Mono") != std::string::npos) {
+        LOG_WARN("sceKernelExitProcess called from Mono thread {} (ID: {}), res={} - ignoring",
+                 thread->name, thread_id, res);
+        return SCE_KERNEL_OK;
+    }
+
     // TODO Handle exit code?
     emuenv.kernel.exit_delete_all_threads();
 
