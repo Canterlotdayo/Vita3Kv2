@@ -228,10 +228,20 @@ bool ThreadState::run_loop() {
 
     CoreScheduler *scheduler = kernel.core_scheduler[core_index].get();
 
-    // Only the outermost run_loop owns the scheduler. Nested calls (from
-    // run_callback -> run_loop) skip all scheduler operations because the
-    // core token is already held by this thread from the outer call.
-    const bool owns_scheduler = (scheduler_depth == 0);
+    // Only serialize threads that have an explicit CPU affinity (0x10000,
+    // 0x20000, 0x40000). Threads with default/any-core affinity (0) are NOT
+    // serialized — they run freely in parallel like before.
+    //
+    // This is the key insight: the race condition in Mono only affects threads
+    // that the game explicitly puts on the same core. Module loading threads,
+    // system threads, etc. use default affinity and must not be serialized
+    // (or loading deadlocks due to inter-module dependencies).
+    //
+    // Additionally, only the outermost run_loop manages the scheduler.
+    // Nested calls (from run_callback -> run_loop) skip scheduler ops
+    // because the core token is already held from the outer call.
+    const bool has_explicit_affinity = (affinity_mask != 0 && affinity_mask != SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT);
+    const bool owns_scheduler = has_explicit_affinity && (scheduler_depth == 0);
     scheduler_depth++;
 
     while (true) {
