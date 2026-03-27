@@ -30,7 +30,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 
 class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
     uint32_t tpidruro;
@@ -303,7 +302,6 @@ public:
         if (cpu->log_mem) {
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
         }
-
         return result;
     }
 
@@ -377,26 +375,10 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {
-        ticks_remaining -= static_cast<int64_t>(ticks);
-    }
+    void AddTicks(uint64_t ticks) override {}
 
     uint64_t GetTicksRemaining() override {
-        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
-    }
-
-    // Scheduling quantum. Dynarmic returns from run() when ticks reach 0.
-    // On real Vita (~333 MHz), a 1ms time slice = ~333k cycles.
-    // This quantum controls how long a thread runs before yielding the core
-    // to the CoreScheduler, which picks the next highest-priority thread.
-    // Too small = overhead from frequent context switches.
-    // Too large = poor responsiveness and starvation of lower-priority threads.
-    // 333000 matches the real Vita's ~1ms preemption interval.
-    static constexpr int64_t QUANTUM = 333000;
-    int64_t ticks_remaining = QUANTUM;
-
-    void reset_ticks() {
-        ticks_remaining = QUANTUM;
+        return 1ull << 60;
     }
 };
 
@@ -411,11 +393,12 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    config.enable_cycle_counting = true;
+    config.enable_cycle_counting = false;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
+    config.enable_cycle_counting = false;
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }
@@ -438,9 +421,6 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     Dynarmic::HaltReason halt_reason;
-
-    cb->reset_ticks();
-
     do {
         halt_reason = jit->Run();
     } while ((halt_reason == Dynarmic::HaltReason::Step) || (halt_reason == Dynarmic::HaltReason::CacheInvalidation));

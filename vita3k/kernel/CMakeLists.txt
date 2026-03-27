@@ -10,10 +10,8 @@ set(SOURCE_LIST
 	include/kernel/debugger.h
 	include/kernel/load_self.h
 	include/kernel/callback.h
-	include/kernel/core_scheduler.h
 	src/kernel.cpp
 	src/thread.cpp
-	src/core_scheduler.cpp
 	src/debugger.cpp
 	src/load_self.cpp
 	src/cpu_protocol.cpp

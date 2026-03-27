@@ -16,7 +16,6 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <cpu/functions.h>
-#include <kernel/core_scheduler.h>
 #include <kernel/thread/thread_state.h>
 
 #include <thread>
@@ -70,7 +69,6 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
         priority = init_priority;
     }
     this->affinity_mask = affinity_mask;
-    this->core_index = KernelState::affinity_to_core_index(affinity_mask, id);
     this->stack_size = stack_size;
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
@@ -226,24 +224,6 @@ bool ThreadState::run_loop() {
         returned_value = old_returned_value;
     };
 
-    CoreScheduler *scheduler = kernel.core_scheduler[core_index].get();
-
-    // Only serialize threads that have an explicit CPU affinity (0x10000,
-    // 0x20000, 0x40000). Threads with default/any-core affinity (0) are NOT
-    // serialized — they run freely in parallel like before.
-    //
-    // This is the key insight: the race condition in Mono only affects threads
-    // that the game explicitly puts on the same core. Module loading threads,
-    // system threads, etc. use default affinity and must not be serialized
-    // (or loading deadlocks due to inter-module dependencies).
-    //
-    // Additionally, only the outermost run_loop manages the scheduler.
-    // Nested calls (from run_callback -> run_loop) skip scheduler ops
-    // because the core token is already held from the outer call.
-    const bool has_explicit_affinity = (affinity_mask != 0 && affinity_mask != SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT);
-    const bool owns_scheduler = has_explicit_affinity && (scheduler_depth == 0);
-    scheduler_depth++;
-
     while (true) {
         switch (to_do) {
         case ThreadToDo::remove:
@@ -252,11 +232,6 @@ bool ThreadState::run_loop() {
                 update_status(ThreadStatus::dormant);
             }
 
-            if (owns_scheduler) {
-                scheduler->remove_thread(this);
-            }
-
-            scheduler_depth--;
             return true;
         case ThreadToDo::run:
         case ThreadToDo::step:
@@ -284,36 +259,20 @@ bool ThreadState::run_loop() {
                 }
             }
 
-            if (owns_scheduler) {
-                scheduler->add_thread(this);
-            }
-
             // Run the cpu
             do {
-                if (owns_scheduler) {
-                    scheduler->acquire(this);
-                }
-
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
-                } else {
-                    res = run(*cpu);
-                }
 
-                if (owns_scheduler) {
-                    scheduler->release(this);
-                }
+                } else
+                    res = run(*cpu);
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
-
-            if (owns_scheduler) {
-                scheduler->remove_thread(this);
-            }
 
             lock.lock();
 
@@ -325,10 +284,9 @@ bool ThreadState::run_loop() {
                 LOG_ERROR("Thread {} ({}) experienced a cpu error.", name, cpu->thread_id);
                 returned_value = 0xDEADDEAD;
                 call_level--;
-                if (call_level > 0) {
-                    scheduler_depth--;
+                if (call_level > 0)
+                    // only return if we are inside a callback
                     return true;
-                }
                 break;
             }
 
@@ -337,18 +295,16 @@ bool ThreadState::run_loop() {
                 to_do = ThreadToDo::wait;
             }
 
-            if (call_level < run_level && run_level > 1) {
-                scheduler_depth--;
+            if (call_level < run_level && run_level > 1)
+                // exit requested, exit this callback now
                 return true;
-            }
 
             if (res) {
                 returned_value = read_reg(*cpu, 0);
                 call_level--;
-                if (call_level > 0) {
-                    scheduler_depth--;
+                if (call_level > 0)
+                    // only return if we are inside a callback
                     return true;
-                }
             }
             break;
         case ThreadToDo::wait:

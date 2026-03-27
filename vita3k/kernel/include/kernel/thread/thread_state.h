@@ -83,7 +83,6 @@ struct ThreadState {
 
     int priority;
     SceInt32 affinity_mask;
-    int core_index = 0; // Which core this thread is assigned to (0-2)
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     // set to true if thread is processing kernel callbacks
@@ -144,8 +143,6 @@ private:
     bool run_start_callback = false;
     // when calling sceKernelExitThread or sceKernelExitDeleteThread
     bool run_end_callback = false;
-
-    int scheduler_depth = 0;
 
     MemState &mem;
 };
