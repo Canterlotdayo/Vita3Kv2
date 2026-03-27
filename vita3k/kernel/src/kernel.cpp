@@ -111,9 +111,15 @@ void KernelState::start_preemption_timer() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
             for (int core = 0; core < NUM_CORES; core++) {
-                std::lock_guard<std::mutex> lock(core_sched_mutex[core]);
-                auto thread = core_active_thread[core];
-                if (thread && thread->cpu) {
+                std::shared_ptr<ThreadState> thread;
+                {
+                    std::lock_guard<std::mutex> lock(core_sched_mutex[core]);
+                    thread = core_active_thread[core];
+                }
+                // Call halt_execution outside the mutex to avoid deadlock.
+                // The thread might have been released between the check and here,
+                // but that's fine — halt_execution on a non-running JIT is a no-op.
+                if (thread && thread->cpu && thread->status == ThreadStatus::run) {
                     halt_execution(*thread->cpu);
                 }
             }
