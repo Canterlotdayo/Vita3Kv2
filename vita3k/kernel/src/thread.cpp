@@ -259,14 +259,31 @@ bool ThreadState::run_loop() {
                 }
             }
 
+            // Mono thread serialization.
+            // Mono's mono_class_init uses a non-atomic check+write pattern that
+            // is safe on real Vita (threads on same core are time-sliced, never
+            // parallel) but races on Vita3K (true parallelism). When multiple
+            // Mono worker threads init the same class simultaneously, Mono calls
+            // abort(). Fix: serialize execution of Mono-named threads with a
+            // single mutex. Non-Mono threads run freely with no overhead.
+            const bool is_mono_thread = (name.find("Mono") != std::string::npos);
+
             // Run the cpu
             do {
+                if (is_mono_thread) {
+                    kernel.mono_thread_mutex.lock();
+                }
+
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
-
-                } else
+                } else {
                     res = run(*cpu);
+                }
+
+                if (is_mono_thread) {
+                    kernel.mono_thread_mutex.unlock();
+                }
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
