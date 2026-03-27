@@ -145,6 +145,8 @@ private:
     // when calling sceKernelExitThread or sceKernelExitDeleteThread
     bool run_end_callback = false;
 
+    int scheduler_depth = 0;
+
     MemState &mem;
 };
 

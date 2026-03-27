@@ -226,8 +226,13 @@ bool ThreadState::run_loop() {
         returned_value = old_returned_value;
     };
 
-    // Get the CoreScheduler for this thread's assigned core.
     CoreScheduler *scheduler = kernel.core_scheduler[core_index].get();
+
+    // Only the outermost run_loop owns the scheduler. Nested calls (from
+    // run_callback -> run_loop) skip all scheduler operations because the
+    // core token is already held by this thread from the outer call.
+    const bool owns_scheduler = (scheduler_depth == 0);
+    scheduler_depth++;
 
     while (true) {
         switch (to_do) {
@@ -237,9 +242,11 @@ bool ThreadState::run_loop() {
                 update_status(ThreadStatus::dormant);
             }
 
-            // Remove from core scheduler when thread exits
-            scheduler->remove_thread(this);
+            if (owns_scheduler) {
+                scheduler->remove_thread(this);
+            }
 
+            scheduler_depth--;
             return true;
         case ThreadToDo::run:
         case ThreadToDo::step:
@@ -267,35 +274,15 @@ bool ThreadState::run_loop() {
                 }
             }
 
-            // Per-core time-sliced scheduling using CoreScheduler.
-            //
-            // On the real Vita, threads sharing a CPU core are never truly
-            // parallel — the kernel time-slices them. CoreScheduler enforces
-            // this: only one thread may execute guest code per core at a time.
-            //
-            // Before running guest code, we acquire the core's execution token.
-            // After each quantum (or SVC), we release it so other threads on
-            // the same core get a chance to run. This prevents race conditions
-            // in guest code that assumes single-core serialization (e.g., Mono
-            // class init's non-atomic flag check+write pattern).
-            //
-            // The acquire() call blocks until this thread is the highest-priority
-            // runnable thread on its core and no other thread holds the token.
-            // The release() call passes the token to the next waiting thread.
-            //
-            // SVC calls (sync primitive waits, etc.) are handled WHILE we hold
-            // the token. If an SVC blocks this host thread (e.g., semaphore_wait),
-            // we first release the token so the core isn't stalled. After the
-            // SVC completes (host thread wakes up), we re-acquire before
-            // continuing guest execution.
-
-            // Add ourselves to the run queue and acquire the core token
-            scheduler->add_thread(this);
+            if (owns_scheduler) {
+                scheduler->add_thread(this);
+            }
 
             // Run the cpu
             do {
-                // Acquire core execution token (blocks until we're highest priority)
-                scheduler->acquire(this);
+                if (owns_scheduler) {
+                    scheduler->acquire(this);
+                }
 
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
@@ -304,21 +291,19 @@ bool ThreadState::run_loop() {
                     res = run(*cpu);
                 }
 
-                // Release core token after quantum/SVC/halt — let other threads run
-                scheduler->release(this);
+                if (owns_scheduler) {
+                    scheduler->release(this);
+                }
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
-                    // The SVC handler may block this host thread (e.g., semaphore_wait
-                    // calls status_cond.wait()). The core token is already released
-                    // above, so other threads on this core can proceed while we sleep.
-                    // After the SVC returns, the loop re-acquires the token.
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
 
-            // Remove from run queue when we're done executing
-            scheduler->remove_thread(this);
+            if (owns_scheduler) {
+                scheduler->remove_thread(this);
+            }
 
             lock.lock();
 
@@ -330,9 +315,10 @@ bool ThreadState::run_loop() {
                 LOG_ERROR("Thread {} ({}) experienced a cpu error.", name, cpu->thread_id);
                 returned_value = 0xDEADDEAD;
                 call_level--;
-                if (call_level > 0)
-                    // only return if we are inside a callback
+                if (call_level > 0) {
+                    scheduler_depth--;
                     return true;
+                }
                 break;
             }
 
@@ -341,16 +327,18 @@ bool ThreadState::run_loop() {
                 to_do = ThreadToDo::wait;
             }
 
-            if (call_level < run_level && run_level > 1)
-                // exit requested, exit this callback now
+            if (call_level < run_level && run_level > 1) {
+                scheduler_depth--;
                 return true;
+            }
 
             if (res) {
                 returned_value = read_reg(*cpu, 0);
                 call_level--;
-                if (call_level > 0)
-                    // only return if we are inside a callback
+                if (call_level > 0) {
+                    scheduler_depth--;
                     return true;
+                }
             }
             break;
         case ThreadToDo::wait:
