@@ -73,7 +73,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
 
-    const bool needs_scheduling = (KernelState::affinity_to_core(affinity_mask) >= 0);
+    const bool needs_scheduling = (name.find("Mono") != std::string::npos);
     cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get(), needs_scheduling);
     if (!cpu) {
         return SCE_KERNEL_ERROR_ERROR;
@@ -281,8 +281,9 @@ bool ThreadState::run_loop() {
             // that prevents the parallelism bugs while keeping the existing
             // thread-per-host-thread model intact.
             {
-            const int sched_core = KernelState::affinity_to_core(affinity_mask);
-            const bool is_scheduled = (sched_core >= 0);
+            const bool is_scheduled = (name.find("Mono") != std::string::npos);
+            int sched_core = is_scheduled ? KernelState::affinity_to_core(affinity_mask) : -1;
+            if (is_scheduled && sched_core < 0) sched_core = 0; // Mono with default affinity -> core 0
 
             auto sched_acquire = [&]() {
                 if (!is_scheduled) return;
