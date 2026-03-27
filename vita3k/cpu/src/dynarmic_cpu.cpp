@@ -111,15 +111,22 @@ public:
         if (addr < parent->mem->page_size) {
             auto lr = cpu->get_lr();
 
+            // If we already signaled a Mono exception for this thread during this
+            // run() call, just return NOP. Don't redirect PC — the exception handler
+            // will set the correct PC via SetThreadContextForMono after we're suspended.
+            // HaltExecution was already called; we're just waiting for Dynarmic to
+            // finish the current basic block and return from run().
+            if (mono_exception_signaled) {
+                return 0xE320F000;
+            }
+
             // Try to signal the Mono exception handler. If Mono is loaded and
             // the handler thread is waiting, this suspends the current thread
             // and wakes the handler. Mono will modify our CPU context to jump
             // to the C# exception handler and resume us.
             if (parent->protocol &&
                 parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
-                // Thread has been suspended. Halt execution immediately so Dynarmic
-                // doesn't continue processing the current basic block (which would
-                // trigger more MemoryReadCode/MemoryRead callbacks on null addresses).
+                mono_exception_signaled = true;
                 cpu->jit->HaltExecution();
                 return 0xE320F000;
             }
@@ -149,6 +156,11 @@ public:
     Dynarmic::A32::VAddr last_null_caller_lr = 0;
     uint32_t null_call_count = 0;
 
+    // Set when signal_mono_exception succeeds during a run() call.
+    // Prevents the fallback path from redirecting PC on subsequent
+    // MemoryReadCode callbacks in the same basic block.
+    bool mono_exception_signaled = false;
+
     static void TraceInstruction(uint64_t self_, uint64_t address, uint64_t is_thumb) {
         ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
 
@@ -171,6 +183,14 @@ public:
     T MemoryRead(Dynarmic::A32::VAddr addr) {
         Ptr<T> ptr{ addr };
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
+            // If a Mono exception was already signaled, return 0 without
+            // triggering the escape mechanism. The thread is being suspended;
+            // the exception handler will fix the PC via SetThreadContextForMono.
+            if (mono_exception_signaled) {
+                LOG_TRACE("MemoryRead during Mono exception suspend (addr=0x{:x}) - ignoring", addr);
+                return 0;
+            }
+
             auto pc = this->cpu->get_pc();
 
             // Detect infinite loop: if the same PC keeps reading invalid addresses,
@@ -435,6 +455,7 @@ int DynarmicCPU::run() {
     break_ = false;
     exit_request = false;
     parent->svc_called = false;
+    cb->mono_exception_signaled = false;
     Dynarmic::HaltReason halt_reason;
 
     cb->reset_ticks();
