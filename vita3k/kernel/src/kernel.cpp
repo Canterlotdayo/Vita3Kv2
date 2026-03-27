@@ -102,6 +102,15 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     return true;
 }
 
+int KernelState::affinity_to_core(SceInt32 affinity_mask) {
+    if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
+        return -1; // default affinity = no scheduling
+    if (affinity_mask & 0x10000) return 0;
+    if (affinity_mask & 0x20000) return 1;
+    if (affinity_mask & 0x40000) return 2;
+    return -1;
+}
+
 void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
     const SceProcessParam *param = ptr.cast<SceProcessParam>().get(mem);
     if (param->version == 0) {

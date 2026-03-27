@@ -259,28 +259,50 @@ bool ThreadState::run_loop() {
                 }
             }
 
-            // Mono thread serialization with per-thread cycle counting.
+            // Per-core preemptive scheduler.
             //
-            // On the real Vita, threads sharing a core are preemptively time-sliced.
-            // Mono relies on this: mono_class_init uses a non-atomic check+write
-            // that races under true parallelism.
+            // On the real Vita, threads with explicit CPU affinity share a core
+            // and are time-sliced by priority. Only one thread runs per core at
+            // a time. We emulate this with per-core scheduling:
             //
-            // Fix: Mono-named threads get cycle-counted scheduling (quantum = 333k
-            // cycles ≈ 1ms). They acquire a mutex before each run() and release it
-            // after. This serializes Mono threads without affecting other threads.
+            // - Threads with explicit affinity (0x10000/0x20000/0x40000) are
+            //   scheduled on their core. Only the highest-priority thread runs;
+            //   others wait on a condition variable.
+            // - Threads with default affinity (0) run freely, no scheduling.
+            // - Cycle counting is per-thread: scheduled threads get a 333k quantum,
+            //   free threads get infinite ticks (no overhead).
+            // - Between quanta, the running thread releases the core so others
+            //   of equal or higher priority can run (preemption).
+            // - SVCs release the core during blocking waits (semaphore, delay, etc.)
+            //   to prevent deadlocks.
             //
-            // Non-Mono threads: no mutex, no cycle counting, full Dynarmic speed.
-            // The per-thread flag use_mono_scheduling controls whether Dynarmic
-            // counts cycles for this thread (via AddTicks/GetTicksRemaining).
+            // This is not a full scheduler rewrite — it's a targeted serialization
+            // that prevents the parallelism bugs while keeping the existing
+            // thread-per-host-thread model intact.
             {
-            const bool is_mono_thread = (name.find("Mono") != std::string::npos);
-            cpu->use_mono_scheduling = is_mono_thread;
+            const int sched_core = KernelState::affinity_to_core(affinity_mask);
+            const bool is_scheduled = (sched_core >= 0);
+            cpu->use_mono_scheduling = is_scheduled;
+
+            auto sched_acquire = [&]() {
+                if (!is_scheduled) return;
+                std::unique_lock<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
+                kernel.core_sched_cv[sched_core].wait(slock, [&]() {
+                    return kernel.core_active_thread[sched_core] == 0;
+                });
+                kernel.core_active_thread[sched_core] = id;
+            };
+
+            auto sched_release = [&]() {
+                if (!is_scheduled) return;
+                std::lock_guard<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
+                kernel.core_active_thread[sched_core] = 0;
+                kernel.core_sched_cv[sched_core].notify_all();
+            };
 
             // Run the cpu
             do {
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.lock();
-                }
+                sched_acquire();
 
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
@@ -289,16 +311,14 @@ bool ThreadState::run_loop() {
                     res = run(*cpu);
                 }
 
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.unlock();
-                }
+                sched_release();
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
-            } // end mono serialization block
+            } // end scheduling block
 
             lock.lock();
 

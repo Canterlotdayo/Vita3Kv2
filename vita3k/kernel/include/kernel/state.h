@@ -31,6 +31,7 @@
 #include <util/types.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -152,9 +153,28 @@ struct KernelState {
     // conditions in guest code that assumes single-core cooperative scheduling.
     // These mutexes + cycle-limited execution emulate per-core time slicing.
     static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
-    // Serializes Mono worker thread execution to prevent race conditions
-    // in mono_class_init. Only threads named "Mono" acquire this mutex.
-    std::mutex mono_thread_mutex;
+
+    // Per-core preemptive scheduler.
+    // On the real Vita, threads sharing a CPU core are time-sliced by priority.
+    // Only one thread runs per core at a time. We emulate this for threads with
+    // explicit CPU affinity (0x10000, 0x20000, 0x40000). Threads with default
+    // affinity (0) run freely without scheduling overhead.
+    //
+    // Each core has a mutex + condvar. A thread wanting to run on a core:
+    // 1. Locks core_sched_mutex[core]
+    // 2. Sets itself as wanting to run
+    // 3. Waits on core_sched_cv[core] until it's the highest-priority waiter
+    //    and the core is free (core_active_thread[core] == 0)
+    // 4. Sets core_active_thread[core] = its ID
+    // 5. Unlocks mutex, runs guest code for one quantum
+    // 6. Locks mutex, clears core_active_thread, notifies all waiters
+    // 7. Repeats from step 3
+    std::mutex core_sched_mutex[NUM_CORES];
+    std::condition_variable core_sched_cv[NUM_CORES];
+    SceUID core_active_thread[NUM_CORES] = {0, 0, 0}; // thread ID currently running on each core
+    
+    // Get the core index for a given affinity mask. Returns -1 for default/any affinity.
+    static int affinity_to_core(SceInt32 affinity_mask);
 
     // Mono exception handler mechanism:
     // On real Vita, when a thread hits a null pointer / illegal access, the kernel
