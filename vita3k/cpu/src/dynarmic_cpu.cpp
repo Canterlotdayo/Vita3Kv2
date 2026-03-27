@@ -399,23 +399,18 @@ public:
     }
 
     void AddTicks(uint64_t ticks) override {
-        if (parent->use_mono_scheduling) {
-            ticks_remaining -= static_cast<int64_t>(ticks);
-        }
+        ticks_remaining -= static_cast<int64_t>(ticks);
     }
 
     uint64_t GetTicksRemaining() override {
-        if (parent->use_mono_scheduling) {
-            return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
-        }
-        return 1ull << 60;
+        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
     }
 
-    static constexpr int64_t MONO_QUANTUM = 333000;
-    int64_t ticks_remaining = MONO_QUANTUM;
+    static constexpr int64_t SCHED_QUANTUM = 333000; // ~1ms at 333MHz
+    int64_t ticks_remaining = SCHED_QUANTUM;
 
     void reset_ticks() {
-        ticks_remaining = MONO_QUANTUM;
+        ticks_remaining = SCHED_QUANTUM;
     }
 };
 
@@ -430,10 +425,10 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    // Must be true for AddTicks/GetTicksRemaining to be called.
-    // Per-thread overhead is controlled by use_mono_scheduling flag:
-    // non-Mono threads return 1<<60 ticks (effectively free).
-    config.enable_cycle_counting = true;
+    // Per-thread cycle counting: only threads with explicit CPU affinity
+    // (scheduled threads) get cycle counting for quantum-based preemption.
+    // Other threads run at full Dynarmic speed with no tick overhead.
+    config.enable_cycle_counting = parent->use_mono_scheduling;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
@@ -460,9 +455,7 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     cb->mono_exception_signaled = false;
-    if (parent->use_mono_scheduling) {
-        cb->reset_ticks();
-    }
+    cb->reset_ticks();
     Dynarmic::HaltReason halt_reason;
     do {
         halt_reason = jit->Run();
