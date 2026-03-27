@@ -115,7 +115,7 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, sceKernelWaitExceptionCBForMono) {
-    TRACY_FUNC(sceKernelWaitExceptionCBForMono);
-    return CALL_EXPORT(sceKernelWaitExceptionForMono);
+EXPORT(int, sceKernelWaitExceptionCBForMono, int type, Ptr<uint32_t> pInfo, int flags) {
+    TRACY_FUNC(sceKernelWaitExceptionCBForMono, type, pInfo, flags);
+    return CALL_EXPORT(sceKernelWaitExceptionForMono, type, pInfo, flags);
 }
