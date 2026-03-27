@@ -79,8 +79,11 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
 
         // Only signal if no exception is already pending and handler is registered
         if (kernel->mono_exception_pending || kernel->mono_exception_handler_thread == 0
-            || kernel->mono_exception_sema == 0)
+            || kernel->mono_exception_sema == 0) {
+            LOG_WARN("signal_mono_exception BLOCKED: pending={}, handler={}, sema={}",
+                     kernel->mono_exception_pending, kernel->mono_exception_handler_thread, kernel->mono_exception_sema);
             return false;
+        }
 
         kernel->mono_exception_pending = true;
         kernel->mono_exception_thread_id = thread_id;
@@ -88,6 +91,8 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
         kernel->mono_exception_fault_pc = fault_pc;
         sema = kernel->mono_exception_sema;
     }
+
+    LOG_WARN("signal_mono_exception: thread {}, fault_pc=0x{:08X}", thread_id, fault_pc);
 
     // Suspend the faulting thread
     auto faulting_thread = kernel->get_thread(thread_id);
