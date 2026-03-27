@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <cpu/functions.h>
+#include <kernel/core_scheduler.h>
 #include <kernel/thread/thread_state.h>
 
 #include <thread>
@@ -69,6 +70,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
         priority = init_priority;
     }
     this->affinity_mask = affinity_mask;
+    this->core_index = KernelState::affinity_to_core_index(affinity_mask, id);
     this->stack_size = stack_size;
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
@@ -224,6 +226,9 @@ bool ThreadState::run_loop() {
         returned_value = old_returned_value;
     };
 
+    // Get the CoreScheduler for this thread's assigned core.
+    CoreScheduler *scheduler = kernel.core_scheduler[core_index].get();
+
     while (true) {
         switch (to_do) {
         case ThreadToDo::remove:
@@ -231,6 +236,9 @@ bool ThreadState::run_loop() {
                 run_thread_end_callback();
                 update_status(ThreadStatus::dormant);
             }
+
+            // Remove from core scheduler when thread exits
+            scheduler->remove_thread(this);
 
             return true;
         case ThreadToDo::run:
@@ -259,34 +267,35 @@ bool ThreadState::run_loop() {
                 }
             }
 
-            // Per-core time-sliced scheduling.
-            // On the real Vita, threads with the same CPU affinity share a core
-            // and are preemptively time-sliced. Only one thread runs per core at
-            // a time. We emulate this with:
-            // - Cycle-limited run() (quantum) so threads yield the core frequently
-            // - Per-core mutex with try_lock (never blocks, avoids deadlock)
-            // - yield() when the core is busy (lets the other thread finish its quantum)
-            int core_idx;
-            if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT) {
-                core_idx = id % KernelState::NUM_CORES;
-            } else if (affinity_mask & 0x10000) {
-                core_idx = 0;
-            } else if (affinity_mask & 0x20000) {
-                core_idx = 1;
-            } else {
-                core_idx = 2;
-            }
+            // Per-core time-sliced scheduling using CoreScheduler.
+            //
+            // On the real Vita, threads sharing a CPU core are never truly
+            // parallel — the kernel time-slices them. CoreScheduler enforces
+            // this: only one thread may execute guest code per core at a time.
+            //
+            // Before running guest code, we acquire the core's execution token.
+            // After each quantum (or SVC), we release it so other threads on
+            // the same core get a chance to run. This prevents race conditions
+            // in guest code that assumes single-core serialization (e.g., Mono
+            // class init's non-atomic flag check+write pattern).
+            //
+            // The acquire() call blocks until this thread is the highest-priority
+            // runnable thread on its core and no other thread holds the token.
+            // The release() call passes the token to the next waiting thread.
+            //
+            // SVC calls (sync primitive waits, etc.) are handled WHILE we hold
+            // the token. If an SVC blocks this host thread (e.g., semaphore_wait),
+            // we first release the token so the core isn't stalled. After the
+            // SVC completes (host thread wakes up), we re-acquire before
+            // continuing guest execution.
+
+            // Add ourselves to the run queue and acquire the core token
+            scheduler->add_thread(this);
 
             // Run the cpu
             do {
-                // Try to acquire this core. If another thread on the same core
-                // is running, yield and retry. Never block (no deadlock possible).
-                while (!kernel.core_mutex[core_idx].try_lock()) {
-                    std::this_thread::yield();
-                    // If we've been told to stop while waiting, break out
-                    if (to_do != ThreadToDo::run && to_do != ThreadToDo::step)
-                        break;
-                }
+                // Acquire core execution token (blocks until we're highest priority)
+                scheduler->acquire(this);
 
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
@@ -295,13 +304,21 @@ bool ThreadState::run_loop() {
                     res = run(*cpu);
                 }
 
-                kernel.core_mutex[core_idx].unlock();
+                // Release core token after quantum/SVC/halt — let other threads run
+                scheduler->release(this);
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
+                    // The SVC handler may block this host thread (e.g., semaphore_wait
+                    // calls status_cond.wait()). The core token is already released
+                    // above, so other threads on this core can proceed while we sleep.
+                    // After the SVC returns, the loop re-acquires the token.
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
+
+            // Remove from run queue when we're done executing
+            scheduler->remove_thread(this);
 
             lock.lock();
 

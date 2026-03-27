@@ -1,0 +1,524 @@
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index a58243c3..17743680 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -304,16 +304,6 @@ public:
+             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
+         }
+ 
+-        // If the exclusive write failed (STREX returned failure), yield to let
+-        // the thread holding the spinlock make progress. On real Vita hardware,
+-        // threads on the same core are time-sliced by the kernel, so a spinning
+-        // thread would eventually be preempted. In Vita3K, threads run on separate
+-        // host threads with true parallelism, so without this yield, a spin-loop
+-        // can starve the lock holder and cause deadlock-like behavior.
+-        if (!result) {
+-            std::this_thread::yield();
+-        }
+-
+         return result;
+     }
+ 
+@@ -397,8 +387,12 @@ public:
+ 
+     // Scheduling quantum. Dynarmic returns from run() when ticks reach 0.
+     // On real Vita (~333 MHz), a 1ms time slice = ~333k cycles.
+-    // We use a smaller quantum for more responsive scheduling.
+-    static constexpr int64_t QUANTUM = 1024;
++    // This quantum controls how long a thread runs before yielding the core
++    // to the CoreScheduler, which picks the next highest-priority thread.
++    // Too small = overhead from frequent context switches.
++    // Too large = poor responsiveness and starvation of lower-priority threads.
++    // 333000 matches the real Vita's ~1ms preemption interval.
++    static constexpr int64_t QUANTUM = 333000;
+     int64_t ticks_remaining = QUANTUM;
+ 
+     void reset_ticks() {
+diff --git a/vita3k/kernel/CMakeLists.txt b/vita3k/kernel/CMakeLists.txt
+index 40d57cb7..4296403b 100644
+--- a/vita3k/kernel/CMakeLists.txt
++++ b/vita3k/kernel/CMakeLists.txt
+@@ -10,8 +10,10 @@ set(SOURCE_LIST
+ 	include/kernel/debugger.h
+ 	include/kernel/load_self.h
+ 	include/kernel/callback.h
++	include/kernel/core_scheduler.h
+ 	src/kernel.cpp
+ 	src/thread.cpp
++	src/core_scheduler.cpp
+ 	src/debugger.cpp
+ 	src/load_self.cpp
+ 	src/cpu_protocol.cpp
+diff --git a/vita3k/kernel/include/kernel/core_scheduler.h b/vita3k/kernel/include/kernel/core_scheduler.h
+new file mode 100644
+index 00000000..b757ce06
+--- /dev/null
++++ b/vita3k/kernel/include/kernel/core_scheduler.h
+@@ -0,0 +1,110 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <util/types.h>
++
++#include <condition_variable>
++#include <mutex>
++#include <set>
++#include <atomic>
++
++struct ThreadState;
++
++// Per-core cooperative scheduler.
++//
++// On the real PS Vita, each of the 3 user CPU cores runs one thread at a time,
++// preemptively time-slicing between threads assigned to that core by priority.
++// Threads on the same core are NEVER truly parallel — they are interleaved.
++//
++// Vita3K originally created one host OS thread per guest thread, meaning threads
++// on the "same core" could execute simultaneously on different physical cores.
++// This causes race conditions in guest code that relies on single-core atomicity
++// (e.g., Mono's class init, which uses a simple flag check + write pattern that
++// is safe when serialized but broken under true parallelism).
++//
++// CoreScheduler serializes execution: only one guest thread may execute guest code
++// on a given core at any time. It uses a token-passing model:
++//
++//   1. Before running guest code, a thread calls acquire() to get the core token.
++//      If another thread holds it, the caller sleeps on a condition variable.
++//
++//   2. After a scheduling quantum expires (Dynarmic returns due to tick exhaustion)
++//      or before an SVC that may block (sync primitive wait), the thread calls
++//      release() to pass the token to the next highest-priority waiting thread.
++//
++//   3. When a thread blocks on a sync primitive, it releases the token. When woken,
++//      it re-acquires. This keeps the core productive while threads are sleeping.
++//
++// Priority ordering: lower numeric priority = higher scheduling priority (matching
++// the Vita's convention where SCE_KERNEL_HIGHEST_PRIORITY_USER = 64).
++
++class CoreScheduler {
++public:
++    explicit CoreScheduler(int core_id);
++
++    // Acquire the execution token for this core.
++    // Blocks until this thread is the highest-priority runnable thread
++    // and no other thread holds the token.
++    // Must be called before executing any guest code.
++    void acquire(ThreadState *thread);
++
++    // Release the execution token, allowing the next thread to run.
++    // Must be called after guest code returns (quantum expired, SVC, halt).
++    void release(ThreadState *thread);
++
++    // Add a thread to this core's run queue.
++    // Called when a thread is created/started with affinity for this core,
++    // or when a thread is woken from a sync primitive wait.
++    void add_thread(ThreadState *thread);
++
++    // Remove a thread from this core's run queue.
++    // Called when a thread exits, is deleted, or changes affinity.
++    void remove_thread(ThreadState *thread);
++
++    // Check if a thread is currently the active (token-holding) thread.
++    bool is_active(ThreadState *thread) const;
++
++    // Yield: release and immediately re-acquire (goes to back of same-priority group).
++    // Convenience for quantum expiry.
++    void yield(ThreadState *thread);
++
++    int get_core_id() const { return core_id; }
++
++private:
++    // Comparison: lower priority value = runs first (higher scheduling priority).
++    // Ties broken by thread ID for determinism.
++    struct ThreadPriorityCompare {
++        bool operator()(const ThreadState *a, const ThreadState *b) const;
++    };
++
++    int core_id;
++
++    mutable std::mutex mutex;
++    std::condition_variable cv;
++
++    // The thread currently holding the execution token (running guest code).
++    // nullptr if no thread is running.
++    ThreadState *active_thread = nullptr;
++
++    // Threads waiting to run on this core, ordered by priority.
++    std::set<ThreadState *, ThreadPriorityCompare> run_queue;
++
++    // Pick the highest-priority thread from the run queue.
++    ThreadState *pick_next() const;
++};
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index 69887c8e..028b117e 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -18,6 +18,7 @@
+ #pragma once
+ 
+ #include <kernel/callback.h>
++#include <kernel/core_scheduler.h>
+ #include <kernel/cpu_protocol.h>
+ #include <kernel/debugger.h>
+ #include <kernel/object_store.h>
+@@ -32,6 +33,7 @@
+ 
+ #include <atomic>
+ #include <map>
++#include <memory>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -150,9 +152,15 @@ struct KernelState {
+     // share a core and are time-sliced (never truly parallel). Vita3K runs each
+     // guest thread on its own host thread, causing true parallelism and race
+     // conditions in guest code that assumes single-core cooperative scheduling.
+-    // These mutexes + cycle-limited execution emulate per-core time slicing.
++    //
++    // CoreScheduler serializes guest thread execution per-core: only one thread
++    // runs guest code on a given core at any time. Threads acquire/release the
++    // core token around guest code execution, with priority-based scheduling.
+     static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
+-    std::mutex core_mutex[NUM_CORES];
++    std::unique_ptr<CoreScheduler> core_scheduler[NUM_CORES];
++
++    // Map a thread's affinity mask to a core index (0, 1, or 2).
++    static int affinity_to_core_index(SceInt32 affinity_mask, SceUID thread_id);
+ 
+     // Mono exception handler mechanism:
+     // On real Vita, when a thread hits a null pointer / illegal access, the kernel
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 823cf485..7ab11686 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -83,6 +83,7 @@ struct ThreadState {
+ 
+     int priority;
+     SceInt32 affinity_mask;
++    int core_index = 0; // Which core this thread is assigned to (0-2)
+     uint64_t start_tick;
+     uint64_t last_vblank_waited;
+     // set to true if thread is processing kernel callbacks
+diff --git a/vita3k/kernel/src/core_scheduler.cpp b/vita3k/kernel/src/core_scheduler.cpp
+new file mode 100644
+index 00000000..5934d2d7
+--- /dev/null
++++ b/vita3k/kernel/src/core_scheduler.cpp
+@@ -0,0 +1,125 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <kernel/core_scheduler.h>
++#include <kernel/thread/thread_state.h>
++
++#include <util/log.h>
++
++#include <algorithm>
++#include <cassert>
++
++bool CoreScheduler::ThreadPriorityCompare::operator()(const ThreadState *a, const ThreadState *b) const {
++    // Lower priority value = higher scheduling priority (runs first).
++    // On the Vita, priority 64 is highest for user threads, 191 is lowest.
++    if (a->priority != b->priority)
++        return a->priority < b->priority;
++    // Tie-break by thread ID for deterministic ordering.
++    return a->id < b->id;
++}
++
++CoreScheduler::CoreScheduler(int core_id)
++    : core_id(core_id) {
++}
++
++void CoreScheduler::acquire(ThreadState *thread) {
++    std::unique_lock<std::mutex> lock(mutex);
++
++    // The thread must be in the run queue to acquire.
++    // (It should have been added via add_thread before this call.)
++    // If not in the run queue, add it now as a safety net.
++    if (run_queue.find(thread) == run_queue.end()) {
++        run_queue.insert(thread);
++    }
++
++    // Wait until:
++    // 1. No other thread holds the token (active_thread == nullptr), AND
++    // 2. This thread is the highest-priority thread in the run queue.
++    cv.wait(lock, [&]() {
++        return active_thread == nullptr && pick_next() == thread;
++    });
++
++    active_thread = thread;
++}
++
++void CoreScheduler::release(ThreadState *thread) {
++    std::unique_lock<std::mutex> lock(mutex);
++
++    if (active_thread != thread) {
++        // Thread is not the active thread — this can happen if:
++        // - Thread was stopped/removed while running
++        // - Double-release (benign, just return)
++        return;
++    }
++
++    active_thread = nullptr;
++
++    // Wake all waiters so the highest-priority one can acquire.
++    // Using notify_all because we need the specific highest-priority
++    // thread to wake up and check its condition.
++    cv.notify_all();
++}
++
++void CoreScheduler::add_thread(ThreadState *thread) {
++    std::unique_lock<std::mutex> lock(mutex);
++    run_queue.insert(thread);
++
++    // If no thread is currently active, wake waiters so the new thread
++    // (or a higher-priority one) can acquire.
++    if (active_thread == nullptr) {
++        cv.notify_all();
++    }
++}
++
++void CoreScheduler::remove_thread(ThreadState *thread) {
++    std::unique_lock<std::mutex> lock(mutex);
++    run_queue.erase(thread);
++
++    // If this thread was the active one, clear it and wake others.
++    if (active_thread == thread) {
++        active_thread = nullptr;
++        cv.notify_all();
++    }
++}
++
++bool CoreScheduler::is_active(ThreadState *thread) const {
++    std::unique_lock<std::mutex> lock(mutex);
++    return active_thread == thread;
++}
++
++void CoreScheduler::yield(ThreadState *thread) {
++    // Release and re-acquire. Since the thread stays in the run queue,
++    // if it's still the highest priority, it will immediately re-acquire.
++    // If a same-priority thread is waiting, the set ordering (by ID) means
++    // we need a mechanism to let others run. We handle this by temporarily
++    // removing and re-inserting (which doesn't change position in set since
++    // ordering is deterministic). Instead, we just release and re-acquire —
++    // the notify_all in release() will wake all waiters, and the first one
++    // to check pick_next() == self will win. For same-priority round-robin,
++    // the current thread is still in the set and may win again, but that's
++    // acceptable since true round-robin within a priority level is a
++    // refinement that can be added later.
++    release(thread);
++    acquire(thread);
++}
++
++ThreadState *CoreScheduler::pick_next() const {
++    // The set is ordered by priority (lowest value first = highest priority).
++    if (run_queue.empty())
++        return nullptr;
++    return *run_queue.begin();
++}
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index 6fddc75e..7879424b 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <kernel/state.h>
+ 
++#include <kernel/core_scheduler.h>
+ #include <kernel/thread/thread_state.h>
+ 
+ #include <cpu/functions.h>
+@@ -99,9 +100,38 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
+     cpu_protocol = std::make_unique<CPUProtocol>(*this, mem, call_import);
+     this->cpu_opt = cpu_opt;
+ 
++    // Initialize per-core schedulers
++    for (int i = 0; i < NUM_CORES; i++) {
++        core_scheduler[i] = std::make_unique<CoreScheduler>(i);
++    }
++
+     return true;
+ }
+ 
++int KernelState::affinity_to_core_index(SceInt32 affinity_mask, SceUID thread_id) {
++    // The Vita has 3 user-accessible CPU cores with affinity bits:
++    //   Core 0: 0x10000
++    //   Core 1: 0x20000
++    //   Core 2: 0x40000
++    // A thread with affinity_mask 0 or SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT
++    // can run on any core — we assign by thread ID for distribution.
++    // A thread with multiple bits set (e.g., 0x30000 = cores 0+1) is assigned
++    // to its preferred (lowest-numbered) core. The real Vita would migrate threads
++    // between cores dynamically, but single-core assignment is sufficient to
++    // prevent the parallelism bugs we're trying to fix.
++    if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT) {
++        return thread_id % NUM_CORES;
++    }
++    if (affinity_mask & 0x10000)
++        return 0;
++    if (affinity_mask & 0x20000)
++        return 1;
++    if (affinity_mask & 0x40000)
++        return 2;
++    // Fallback
++    return thread_id % NUM_CORES;
++}
++
+ void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
+     const SceProcessParam *param = ptr.cast<SceProcessParam>().get(mem);
+     if (param->version == 0) {
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index a7d83928..44e34e3b 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -16,6 +16,7 @@
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ #include <cpu/functions.h>
++#include <kernel/core_scheduler.h>
+ #include <kernel/thread/thread_state.h>
+ 
+ #include <thread>
+@@ -69,6 +70,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+         priority = init_priority;
+     }
+     this->affinity_mask = affinity_mask;
++    this->core_index = KernelState::affinity_to_core_index(affinity_mask, id);
+     this->stack_size = stack_size;
+     start_tick = rtc_get_ticks(kernel.base_tick.tick);
+     last_vblank_waited = 0;
+@@ -224,6 +226,9 @@ bool ThreadState::run_loop() {
+         returned_value = old_returned_value;
+     };
+ 
++    // Get the CoreScheduler for this thread's assigned core.
++    CoreScheduler *scheduler = kernel.core_scheduler[core_index].get();
++
+     while (true) {
+         switch (to_do) {
+         case ThreadToDo::remove:
+@@ -232,6 +237,9 @@ bool ThreadState::run_loop() {
+                 update_status(ThreadStatus::dormant);
+             }
+ 
++            // Remove from core scheduler when thread exits
++            scheduler->remove_thread(this);
++
+             return true;
+         case ThreadToDo::run:
+         case ThreadToDo::step:
+@@ -259,34 +267,35 @@ bool ThreadState::run_loop() {
+                 }
+             }
+ 
+-            // Per-core time-sliced scheduling.
+-            // On the real Vita, threads with the same CPU affinity share a core
+-            // and are preemptively time-sliced. Only one thread runs per core at
+-            // a time. We emulate this with:
+-            // - Cycle-limited run() (quantum) so threads yield the core frequently
+-            // - Per-core mutex with try_lock (never blocks, avoids deadlock)
+-            // - yield() when the core is busy (lets the other thread finish its quantum)
+-            int core_idx;
+-            if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT) {
+-                core_idx = id % KernelState::NUM_CORES;
+-            } else if (affinity_mask & 0x10000) {
+-                core_idx = 0;
+-            } else if (affinity_mask & 0x20000) {
+-                core_idx = 1;
+-            } else {
+-                core_idx = 2;
+-            }
++            // Per-core time-sliced scheduling using CoreScheduler.
++            //
++            // On the real Vita, threads sharing a CPU core are never truly
++            // parallel — the kernel time-slices them. CoreScheduler enforces
++            // this: only one thread may execute guest code per core at a time.
++            //
++            // Before running guest code, we acquire the core's execution token.
++            // After each quantum (or SVC), we release it so other threads on
++            // the same core get a chance to run. This prevents race conditions
++            // in guest code that assumes single-core serialization (e.g., Mono
++            // class init's non-atomic flag check+write pattern).
++            //
++            // The acquire() call blocks until this thread is the highest-priority
++            // runnable thread on its core and no other thread holds the token.
++            // The release() call passes the token to the next waiting thread.
++            //
++            // SVC calls (sync primitive waits, etc.) are handled WHILE we hold
++            // the token. If an SVC blocks this host thread (e.g., semaphore_wait),
++            // we first release the token so the core isn't stalled. After the
++            // SVC completes (host thread wakes up), we re-acquire before
++            // continuing guest execution.
++
++            // Add ourselves to the run queue and acquire the core token
++            scheduler->add_thread(this);
+ 
+             // Run the cpu
+             do {
+-                // Try to acquire this core. If another thread on the same core
+-                // is running, yield and retry. Never block (no deadlock possible).
+-                while (!kernel.core_mutex[core_idx].try_lock()) {
+-                    std::this_thread::yield();
+-                    // If we've been told to stop while waiting, break out
+-                    if (to_do != ThreadToDo::run && to_do != ThreadToDo::step)
+-                        break;
+-                }
++                // Acquire core execution token (blocks until we're highest priority)
++                scheduler->acquire(this);
+ 
+                 if (to_do == ThreadToDo::step) {
+                     res = step(*cpu);
+@@ -295,14 +304,22 @@ bool ThreadState::run_loop() {
+                     res = run(*cpu);
+                 }
+ 
+-                kernel.core_mutex[core_idx].unlock();
++                // Release core token after quantum/SVC/halt — let other threads run
++                scheduler->release(this);
+ 
+                 // handle svc call if this was what stopped the cpu
+                 if (cpu->svc_called) {
++                    // The SVC handler may block this host thread (e.g., semaphore_wait
++                    // calls status_cond.wait()). The core token is already released
++                    // above, so other threads on this core can proceed while we sleep.
++                    // After the SVC returns, the loop re-acquires the token.
+                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
+                 }
+             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
+ 
++            // Remove from run queue when we're done executing
++            scheduler->remove_thread(this);
++
+             lock.lock();
+ 
+             // Handle errors

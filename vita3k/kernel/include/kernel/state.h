@@ -18,6 +18,7 @@
 #pragma once
 
 #include <kernel/callback.h>
+#include <kernel/core_scheduler.h>
 #include <kernel/cpu_protocol.h>
 #include <kernel/debugger.h>
 #include <kernel/object_store.h>
@@ -32,6 +33,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -150,9 +152,15 @@ struct KernelState {
     // share a core and are time-sliced (never truly parallel). Vita3K runs each
     // guest thread on its own host thread, causing true parallelism and race
     // conditions in guest code that assumes single-core cooperative scheduling.
-    // These mutexes + cycle-limited execution emulate per-core time slicing.
+    //
+    // CoreScheduler serializes guest thread execution per-core: only one thread
+    // runs guest code on a given core at any time. Threads acquire/release the
+    // core token around guest code execution, with priority-based scheduling.
     static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
-    std::mutex core_mutex[NUM_CORES];
+    std::unique_ptr<CoreScheduler> core_scheduler[NUM_CORES];
+
+    // Map a thread's affinity mask to a core index (0, 1, or 2).
+    static int affinity_to_core_index(SceInt32 affinity_mask, SceUID thread_id);
 
     // Mono exception handler mechanism:
     // On real Vita, when a thread hits a null pointer / illegal access, the kernel

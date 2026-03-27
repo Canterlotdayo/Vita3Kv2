@@ -304,16 +304,6 @@ public:
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
         }
 
-        // If the exclusive write failed (STREX returned failure), yield to let
-        // the thread holding the spinlock make progress. On real Vita hardware,
-        // threads on the same core are time-sliced by the kernel, so a spinning
-        // thread would eventually be preempted. In Vita3K, threads run on separate
-        // host threads with true parallelism, so without this yield, a spin-loop
-        // can starve the lock holder and cause deadlock-like behavior.
-        if (!result) {
-            std::this_thread::yield();
-        }
-
         return result;
     }
 
@@ -397,8 +387,12 @@ public:
 
     // Scheduling quantum. Dynarmic returns from run() when ticks reach 0.
     // On real Vita (~333 MHz), a 1ms time slice = ~333k cycles.
-    // We use a smaller quantum for more responsive scheduling.
-    static constexpr int64_t QUANTUM = 1024;
+    // This quantum controls how long a thread runs before yielding the core
+    // to the CoreScheduler, which picks the next highest-priority thread.
+    // Too small = overhead from frequent context switches.
+    // Too large = poor responsiveness and starvation of lower-priority threads.
+    // 333000 matches the real Vita's ~1ms preemption interval.
+    static constexpr int64_t QUANTUM = 333000;
     int64_t ticks_remaining = QUANTUM;
 
     void reset_ticks() {

@@ -21,6 +21,7 @@
 
 #include <kernel/state.h>
 
+#include <kernel/core_scheduler.h>
 #include <kernel/thread/thread_state.h>
 
 #include <cpu/functions.h>
@@ -99,7 +100,36 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     cpu_protocol = std::make_unique<CPUProtocol>(*this, mem, call_import);
     this->cpu_opt = cpu_opt;
 
+    // Initialize per-core schedulers
+    for (int i = 0; i < NUM_CORES; i++) {
+        core_scheduler[i] = std::make_unique<CoreScheduler>(i);
+    }
+
     return true;
+}
+
+int KernelState::affinity_to_core_index(SceInt32 affinity_mask, SceUID thread_id) {
+    // The Vita has 3 user-accessible CPU cores with affinity bits:
+    //   Core 0: 0x10000
+    //   Core 1: 0x20000
+    //   Core 2: 0x40000
+    // A thread with affinity_mask 0 or SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT
+    // can run on any core — we assign by thread ID for distribution.
+    // A thread with multiple bits set (e.g., 0x30000 = cores 0+1) is assigned
+    // to its preferred (lowest-numbered) core. The real Vita would migrate threads
+    // between cores dynamically, but single-core assignment is sufficient to
+    // prevent the parallelism bugs we're trying to fix.
+    if (affinity_mask == 0 || affinity_mask == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT) {
+        return thread_id % NUM_CORES;
+    }
+    if (affinity_mask & 0x10000)
+        return 0;
+    if (affinity_mask & 0x20000)
+        return 1;
+    if (affinity_mask & 0x40000)
+        return 2;
+    // Fallback
+    return thread_id % NUM_CORES;
 }
 
 void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
