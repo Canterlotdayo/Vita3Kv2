@@ -688,48 +688,21 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
                  threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
 
-        // When Mono's exception callback fails (r0=0 and PC points to mono-vita),
-        // the thread can't be handled via the normal trampoline. Instead of killing
-        // the thread (which freezes the game), restore the ORIGINAL context from
-        // before the fault with r0=0 and resume normally. The C# JIT code has
-        // null checks (cmp r0, #0; bne) that will handle r0=0 gracefully,
-        // taking the "null object" code path instead of the virtual call path.
+        // Safety net: if Mono's exception callback somehow produced r0=0
+        // (should not happen now that exit() blocks forever in g_error path),
+        // log it for debugging. The thread will be resumed with whatever
+        // context the callback set — it may fault again but won't loop
+        // because signal_mono_exception checks dead_threads.
         bool is_mono_exception_context = (emuenv.kernel.mono_exception_handler_thread != 0 &&
                                           new_pc >= emuenv.kernel.mono_code_start &&
                                           new_pc < emuenv.kernel.mono_code_end);
 
         if (infoCpu->reg[0] == 0 && is_mono_exception_context) {
-            emuenv.kernel.mono_exception_null_count++;
-
-            // Restore the saved context from before the fault
-            CPUContext &saved = emuenv.kernel.mono_exception_saved_context;
-            Address original_pc = saved.cpu_registers[15];
-            Address original_sp = saved.cpu_registers[13];
-            Address original_lr = saved.cpu_registers[14];
-
-            if (emuenv.kernel.mono_exception_null_count <= 3) {
-                LOG_WARN("  SetCtx: Mono exception NULL — restoring original context with r0=0 "
-                         "(PC=0x{:08X}, SP=0x{:08X}, LR=0x{:08X}) for thread {}",
-                         original_lr, original_sp, original_lr, threadId);
-            }
-
-            // Overwrite what the callback wrote — use the original register state
-            // but set r0=0 so C# null checks work, and PC=LR to return to caller
-            memcpy(infoCpu->reg, saved.cpu_registers.data(), 16 * 4);
-            infoCpu->reg[0] = 0;          // r0 = null (triggers C# null check paths)
-            infoCpu->reg[15] = original_lr; // PC = return to caller of faulting function
-            infoCpu->cpsr = saved.cpsr;
-
-            // Mark thread so we don't re-signal if it faults again immediately
+            LOG_WARN("  SetCtx: Mono exception callback produced r0=0 for thread {} (unexpected)", threadId);
             {
                 std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
                 emuenv.kernel.mono_exception_dead_threads.insert(threadId);
             }
-
-            emuenv.kernel.mono_exception_skip_resume = false; // DO resume the thread
-        } else if (infoCpu->reg[0] != 0 && is_mono_exception_context) {
-            emuenv.kernel.mono_exception_null_count = 0;
-            emuenv.kernel.mono_exception_skip_resume = false;
         }
 
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);

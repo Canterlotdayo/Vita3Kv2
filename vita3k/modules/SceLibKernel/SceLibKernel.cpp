@@ -1309,27 +1309,21 @@ EXPORT(int, sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
 EXPORT(int, sceKernelExitProcess, int res) {
     TRACY_FUNC(sceKernelExitProcess, res);
 
-    // If called from a Mono thread, this is part of the abort() chain:
-    // g_error → exit() → sceKernelExitProcess
-    // On real Vita, exit() never returns — the process terminates.
-    // We can't kill the whole process, but we MUST NOT return:
-    // if exit() returns, g_error returns, and the caller (Mono exception
-    // callback) falls through to a NULL pointer dereference that cascades
-    // into infinite re-faults.
+    // On real Vita, sceKernelExitProcess terminates the entire process.
+    // exit() calls this and NEVER returns on any real OS.
+    // In Vita3K, we can't terminate the emulator, so we block the calling
+    // thread forever. This is critical for Mono/Unity games where:
+    // g_error → exit() → sceKernelExitProcess → if this returns,
+    // g_error returns, and the Mono exception callback falls through to
+    // a NULL pointer dereference that cascades into infinite re-faults.
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    if (thread && thread->name.find("Mono") != std::string::npos) {
-        LOG_WARN("sceKernelExitProcess called from Mono thread {} (ID: {}), res={} — blocking forever",
-                 thread->name, thread_id, res);
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::hours(24));
-        }
-        return 0; // unreachable
+    LOG_WARN("sceKernelExitProcess called from thread {} (ID: {}), res={} — blocking forever (exit never returns)",
+             thread ? thread->name : "unknown", thread_id, res);
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::hours(24));
     }
-
-    // TODO Handle exit code?
-    emuenv.kernel.exit_delete_all_threads();
-
-    return SCE_KERNEL_OK;
+    return 0; // unreachable
 }
 
 EXPORT(SceInt32, sceKernelGetCallbackInfo, SceUID callbackId, Ptr<SceKernelCallbackInfo> pInfo) {

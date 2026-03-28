@@ -151,18 +151,6 @@ struct KernelState {
     Address mono_code_end = 0;
     Address mono_data_start = 0;    // segment 1 base of mono-vita.suprx
 
-    // Offsets within mono-vita data segment for the GC thread exception table.
-    // These are found via Ghidra analysis of mono-vita.suprx.
-    // The table is used by the Mono exception callback to find the GC handler
-    // block guard for a faulting thread. If a thread is not in this table,
-    // the callback crashes (writes to NULL pointer).
-    // On real Vita, every thread is registered via GC_psp2_init → FUN_84dc90d0.
-    // But the registration only happens for the FIRST thread (one-time guard).
-    // We fix this by writing directly to the table for each Mono thread.
-    static constexpr uint32_t MONO_GC_TABLE_OFFSET = 0x66A10;    // DAT_848b6a10 - data_base
-    static constexpr uint32_t MONO_GC_COUNTER_OFFSET = 0x4F34;   // DAT_84854f34 - data_base
-    static constexpr int MONO_GC_TABLE_MAX = 256;
-
     // Per-core scheduling: on the real Vita, threads with the same CPU affinity
     // share a core and are time-sliced (never truly parallel). Vita3K runs each
     // guest thread on its own host thread, causing true parallelism and race
