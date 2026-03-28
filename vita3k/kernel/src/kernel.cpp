@@ -102,50 +102,6 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     return true;
 }
 
-void KernelState::start_preemption_timer() {
-    preemption_timer_running = true;
-    preemption_timer_thread = std::thread([this]() {
-        uint64_t tick_count = 0;
-        while (preemption_timer_running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            tick_count++;
-
-            for (int core = 0; core < NUM_CORES; core++) {
-                std::shared_ptr<ThreadState> thread;
-                {
-                    std::lock_guard<std::mutex> lock(core_sched_mutex[core]);
-                    thread = core_active_thread[core];
-                }
-                if (thread && thread->cpu && thread->status == ThreadStatus::run) {
-                    if ((tick_count & 0x3FF) == 0) { // log every ~1 second
-                        LOG_INFO("Preemption timer: halting thread {} ({}) on core {}",
-                                 thread->name, thread->id, core);
-                    }
-                    halt_execution(*thread->cpu);
-                }
-            }
-        }
-    });
-}
-
-void KernelState::stop_preemption_timer() {
-    preemption_timer_running = false;
-    if (preemption_timer_thread.joinable()) {
-        preemption_timer_thread.join();
-    }
-}
-
-int KernelState::affinity_to_core(SceInt32 affinity_mask) {
-    // Only schedule threads with a single-core affinity.
-    // Multi-core masks (0x30000, 0x70000, etc.) and default (0) run freely.
-    switch (affinity_mask) {
-    case 0x10000: return 0;
-    case 0x20000: return 1;
-    case 0x40000: return 2;
-    default: return -1;
-    }
-}
-
 void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
     const SceProcessParam *param = ptr.cast<SceProcessParam>().get(mem);
     if (param->version == 0) {
