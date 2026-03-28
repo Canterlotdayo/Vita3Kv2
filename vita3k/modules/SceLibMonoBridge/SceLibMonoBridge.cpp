@@ -1261,8 +1261,10 @@ EXPORT(int, pthread_getspecific_for_thread, int key, SceUID target_thread_id) {
 EXPORT(int, pthread_join, uint32_t thread_handle, void *retval) {
     auto thread = emuenv.kernel.get_thread(static_cast<SceUID>(thread_handle));
     if (thread) {
-        std::unique_lock<std::mutex> lock(thread->mutex);
-        thread->something_to_do.wait(lock, [&] { return thread->status == ThreadStatus::dormant; });
+        // Wait for thread to finish by polling its status
+        while (thread->status != ThreadStatus::dormant) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
     return 0;
 }
