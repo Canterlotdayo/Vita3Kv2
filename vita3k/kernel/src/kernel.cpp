@@ -185,87 +185,71 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
         return nullptr;
 
-    // Detect Mono-related threads: entry point in mono-vita code range OR
-    // thread name contains "Mono". Worker threads may have entry points in
-    // the eboot (C# JIT code) or in mono-vita itself.
-    bool is_mono_thread = false;
-    Address ep = entry_point.address();
-    if (mono_code_start != 0) {
-        // Entry in mono-vita code segment
-        if (ep >= mono_code_start && ep < mono_code_end)
-            is_mono_thread = true;
-        // Entry in eboot (JIT code range 0x80010000-0x84000000 approx)
-        if (ep >= 0x80010000 && ep < mono_code_start)
-            is_mono_thread = true;
-    }
-    if (name && std::string(name).find("Mono") != std::string::npos)
-        is_mono_thread = true;
+    // Detect Mono worker threads by name. Only threads with "Mono" in
+    // their name are actual Mono managed workers that need GC registration.
+    // System threads (SceFios, FMOD, avAudio, Unity*) must NOT be registered
+    // even if their entry points are in the eboot range.
+    bool is_mono_worker = (name && std::string(name).find("Mono") != std::string::npos);
+    bool is_exception_handler = (name && std::string(name).find("ExceptionHandler") != std::string::npos);
 
-    if (is_mono_thread) {
+    if (is_mono_worker || is_exception_handler) {
         thread->cpu->use_mono_scheduling = true;
+    }
 
-        // Register this thread in the Boehm GC so it participates in
-        // stop-the-world collection. Without this, the GC doesn't know about
-        // worker threads → collects objects they still reference → use-after-free
-        // → vtable points to reallocated memory → crash.
-        //
-        // Two tables need entries:
-        // 1. GC hash table (mono_data_start + 0x67A10): 128 buckets, for GC suspend
-        // 2. Exception table (mono_data_start + 0x66A10): flat array, for Mono exception callback
-        //    Counter at mono_data_start + 0x4F34
-        if (mono_data_start != 0) {
-            constexpr uint32_t GC_HASH_TABLE_OFFSET = 0x67A10;
-            constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
-            constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
-            constexpr uint32_t GC_ENTRY_SIZE = 0x24; // 36 bytes
+    // Register actual Mono workers in the GC hash table and exception table.
+    // Not ExceptionHandlerThread (it manages exceptions, doesn't need GC tracking).
+    if (is_mono_worker && !is_exception_handler && mono_data_start != 0) {
+        constexpr uint32_t GC_HASH_TABLE_OFFSET = 0x67A10;
+        constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
+        constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
+        constexpr uint32_t GC_ENTRY_SIZE = 0x24; // 36 bytes
 
-            uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
-            Address stack_bottom = thread->stack_top() - stack_size;
-            Address stack_top_addr = thread->stack_top();
+        Address ep = entry_point.address();
+        uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
+        Address stack_bottom = thread->stack_top() - stack_size;
+        Address stack_top_addr = thread->stack_top();
 
-            // --- GC Hash Table Registration ---
-            Address hash_table_addr = mono_data_start + GC_HASH_TABLE_OFFSET;
-            Address entry_addr = alloc(mem, GC_ENTRY_SIZE, "GC_thread_entry");
-            if (entry_addr) {
-                uint32_t hash = (thread_id_val & 0x7F);
-                Address bucket_addr = hash_table_addr + hash * 4;
-                uint32_t old_head = *Ptr<uint32_t>(bucket_addr).get(mem);
+        // --- GC Hash Table Registration ---
+        Address hash_table_addr = mono_data_start + GC_HASH_TABLE_OFFSET;
+        Address entry_addr = alloc(mem, GC_ENTRY_SIZE, "GC_thread_entry");
+        if (entry_addr) {
+            uint32_t hash = (thread_id_val & 0x7F);
+            Address bucket_addr = hash_table_addr + hash * 4;
+            uint32_t old_head = *Ptr<uint32_t>(bucket_addr).get(mem);
 
-                uint32_t *entry = Ptr<uint32_t>(entry_addr).get(mem);
-                memset(entry, 0, GC_ENTRY_SIZE);
-                entry[0] = old_head;              // next pointer
-                entry[1] = thread_id_val;         // thread_id
-                entry[4] = stack_bottom;          // +0x10: stack_bottom
-                entry[6] = stack_top_addr;        // +0x18: stack_top
+            uint32_t *entry = Ptr<uint32_t>(entry_addr).get(mem);
+            memset(entry, 0, GC_ENTRY_SIZE);
+            entry[0] = old_head;
+            entry[1] = thread_id_val;
+            entry[4] = stack_bottom;
+            entry[6] = stack_top_addr;
 
-                *Ptr<uint32_t>(bucket_addr).get(mem) = entry_addr;
+            *Ptr<uint32_t>(bucket_addr).get(mem) = entry_addr;
+        }
+
+        // --- Exception Table Registration ---
+        // Only write if counter is sane (0-255). Before Mono runtime init,
+        // the counter contains garbage → skip to avoid out-of-bounds write.
+        Address counter_addr = mono_data_start + EXCEPTION_COUNTER_OFFSET;
+        Address table_addr = mono_data_start + EXCEPTION_TABLE_OFFSET;
+        uint32_t *counter = Ptr<uint32_t>(counter_addr).get(mem);
+        uint32_t idx = *counter;
+        if (idx < 256) {
+            Address exc_entry = alloc(mem, 8, "GC_exc_entry");
+            if (exc_entry) {
+                uint32_t *exc = Ptr<uint32_t>(exc_entry).get(mem);
+                exc[0] = thread_id_val;
+                exc[1] = 0;
+
+                uint32_t *table = Ptr<uint32_t>(table_addr).get(mem);
+                table[idx] = exc_entry;
+                *counter = idx + 1;
             }
-
-            // --- Exception Table Registration ---
-            Address counter_addr = mono_data_start + EXCEPTION_COUNTER_OFFSET;
-            Address table_addr = mono_data_start + EXCEPTION_TABLE_OFFSET;
-            uint32_t *counter = Ptr<uint32_t>(counter_addr).get(mem);
-            uint32_t idx = *counter;
-            if (idx < 256) {
-                // Allocate entry: first word = thread_id
-                Address exc_entry = alloc(mem, 8, "GC_exc_entry");
-                if (exc_entry) {
-                    uint32_t *exc = Ptr<uint32_t>(exc_entry).get(mem);
-                    exc[0] = thread_id_val;  // thread_id for callback lookup
-                    exc[1] = 0;              // data (filled by callback)
-
-                    // Store pointer in table
-                    uint32_t *table = Ptr<uint32_t>(table_addr).get(mem);
-                    table[idx] = exc_entry;
-                    *counter = idx + 1;
-                }
-            }
-
-            LOG_INFO("Mono GC: registered thread '{}' (ID:{}, ep=0x{:08X}) in GC hash + exception table (idx={})",
-                     name ? name : "?", thread->id, ep, idx);
+            LOG_INFO("Mono GC: registered '{}' (ID:{}) in GC hash + exception table (idx={})",
+                     name, thread->id, idx);
         } else {
-            LOG_WARN("Mono thread '{}' (ID:{}) created but mono_data_start=0 — cannot register in GC",
-                     name ? name : "?", thread->id);
+            LOG_WARN("Mono GC: skipping exception table for '{}' (ID:{}) — counter={} (not initialized yet)",
+                     name, thread->id, idx);
         }
     }
 
