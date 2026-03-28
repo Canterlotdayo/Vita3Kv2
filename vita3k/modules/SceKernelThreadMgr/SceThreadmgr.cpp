@@ -437,7 +437,26 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
-    const auto context = save_context(*thread->cpu);
+    // For the Mono faulting thread, use the saved context from the moment of
+    // the fault. After signal_mono_exception, the thread continues executing
+    // in the JIT block (NOPs, zero reads) which corrupts ALL registers.
+    // On the real Vita, GetContext returns the state AT the fault instruction.
+    CPUContext context;
+    bool using_saved = false;
+    {
+        std::lock_guard<std::mutex> mlock(emuenv.kernel.mono_exception_mutex);
+        if (emuenv.kernel.mono_exception_thread_id == threadId && emuenv.kernel.mono_exception_pending == false) {
+            // pending was cleared by WaitExceptionForMono — this is the handler reading context
+            context = emuenv.kernel.mono_exception_saved_context;
+            using_saved = true;
+            LOG_WARN("GetThreadContextForVM: using SAVED context for faulting thread {} (PC=0x{:08X})",
+                     threadId, context.cpu_registers[15]);
+        }
+    }
+    if (!using_saved) {
+        context = save_context(*thread->cpu);
+    }
+
     SceKernelThreadCpuRegisterInfo *infoCpu = pCpuRegisterInfo.get(emuenv.mem);
     if (infoCpu) {
         if (infoCpu->size != sizeof(*infoCpu))
@@ -445,22 +464,6 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
 
         infoCpu->cpsr = context.cpsr;
         memcpy(infoCpu->reg, context.cpu_registers.data(), 16 * 4);
-
-        // If this is the Mono faulting thread, override PC with the saved fault PC.
-        // After signal_mono_exception, the thread continues executing in the JIT block
-        // (returning NOPs and 0s) before run() returns. The PC read from the CPU state
-        // is corrupted — it's wherever Dynarmic left off, not the faulting instruction.
-        // On the real Vita, the thread stops immediately at the fault. We emulate this
-        // by restoring the saved fault PC so the Mono callback can properly redirect it.
-        {
-            std::lock_guard<std::mutex> mlock(emuenv.kernel.mono_exception_mutex);
-            if (emuenv.kernel.mono_exception_thread_id == threadId) {
-                infoCpu->reg[15] = emuenv.kernel.mono_exception_fault_pc;
-                LOG_WARN("GetThreadContextForVM: overriding PC for faulting thread {} to saved fault PC 0x{:08X}",
-                         threadId, emuenv.kernel.mono_exception_fault_pc);
-            }
-        }
-
         infoCpu->sb = 100000; // Todo
         infoCpu->st = 100000; // Todo
         infoCpu->teehbr = 100000; // Todo

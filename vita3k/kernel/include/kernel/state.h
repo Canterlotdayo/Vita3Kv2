@@ -19,6 +19,7 @@
 
 #include <kernel/callback.h>
 #include <kernel/cpu_protocol.h>
+#include <cpu/common.h>
 #include <kernel/debugger.h>
 #include <kernel/object_store.h>
 #include <kernel/sync_primitives.h>
@@ -175,6 +176,7 @@ struct KernelState {
     SceUID mono_exception_thread_id = 0;       // faulting thread ID
     Address mono_exception_fault_addr = 0;     // address that caused the fault
     Address mono_exception_fault_pc = 0;       // PC at time of fault
+    CPUContext mono_exception_saved_context;    // full CPU context at time of fault
 
     uint64_t start_tick;
     SceRtcTick base_tick;
