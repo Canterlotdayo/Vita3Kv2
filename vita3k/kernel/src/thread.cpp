@@ -270,14 +270,13 @@ bool ThreadState::run_loop() {
             // - A background timer thread calls halt_execution() every ~1ms
             //   on the active thread, forcing run() to return (preemption).
             // - No cycle counting = zero JIT overhead.
-            // Per-thread cycle counting + per-quantum mutex.
-            // Mono threads get cycle counting (quantum 333k ≈ 1ms) to break
-            // spin-waits. Non-Mono threads: no counting, full speed.
-            // Mutex released between quanta AND at SVCs.
+            // Per-quantum Mono mutex with cycle counting.
+            // Lock/run/unlock each quantum — allows limited parallelism between
+            // quanta while preventing most races. The rare "pending init" race
+            // is handled by the abort handler (returns 0, thread survives).
             {
             const bool is_mono_thread = (name.find("Mono") != std::string::npos);
             cpu->use_mono_scheduling = is_mono_thread;
-            uint32_t quantum_count = 0;
 
             // Run the cpu
             do {
@@ -293,16 +292,11 @@ bool ThreadState::run_loop() {
                 }
 
                 if (is_mono_thread) {
-                    quantum_count++;
                     kernel.mono_thread_mutex.unlock();
                 }
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
-                    if (is_mono_thread && (quantum_count & 0xFF) == 1) {
-                        LOG_INFO("Mono sched: thread {} ({}) SVC 0x{:X} after {} quanta",
-                                 name, id, cpu->svc, quantum_count);
-                    }
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
