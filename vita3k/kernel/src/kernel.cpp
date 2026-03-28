@@ -107,8 +107,10 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
 void KernelState::start_preemption_timer() {
     preemption_timer_running = true;
     preemption_timer_thread = std::thread([this]() {
+        uint64_t tick_count = 0;
         while (preemption_timer_running) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            tick_count++;
 
             for (int core = 0; core < NUM_CORES; core++) {
                 std::shared_ptr<ThreadState> thread;
@@ -116,10 +118,11 @@ void KernelState::start_preemption_timer() {
                     std::lock_guard<std::mutex> lock(core_sched_mutex[core]);
                     thread = core_active_thread[core];
                 }
-                // Call halt_execution outside the mutex to avoid deadlock.
-                // The thread might have been released between the check and here,
-                // but that's fine — halt_execution on a non-running JIT is a no-op.
                 if (thread && thread->cpu && thread->status == ThreadStatus::run) {
+                    if ((tick_count & 0x3FF) == 0) { // log every ~1 second
+                        LOG_INFO("Preemption timer: halting thread {} ({}) on core {}",
+                                 thread->name, thread->id, core);
+                    }
                     halt_execution(*thread->cpu);
                 }
             }
