@@ -723,67 +723,21 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         // and PC to a trampoline epilogue. That epilogue expects a stack frame
         // that doesn't exist, so it would crash and cascade into re-faults.
         //
-        // Fix: skip the trampoline. Pop the faulting function's stack frame
-        // and return to its caller with r0=0.
+        // Fix: halt the thread. On the real Vita, this scenario causes an abort
+        // (sceKernelCallAbortHandler) which blocks the thread forever. The game
+        // continues with one less worker thread. We do the same by jumping to
+        // the halt instruction, which makes the thread exit cleanly.
         if (infoCpu->reg[0] == 0 && emuenv.kernel.mono_exception_thread_id == threadId) {
             emuenv.kernel.mono_exception_null_count++;
-            Address original_sp = emuenv.kernel.mono_exception_saved_context.cpu_registers[13];
-            Address original_lr = emuenv.kernel.mono_exception_saved_context.cpu_registers[14];
 
-            // The faulting C# JIT function typically uses the frame pattern:
-            //   push {r8, fp, ip, lr}   (ip = caller's SP)
-            //   sub  sp, sp, #N         (local vars)
-            // So saved LR is at SP + N + 12, saved ip (caller SP) at SP + N + 8.
-            //
-            // Scan from SP+8 upward (skip first 2 slots = likely local vars),
-            // looking for a value that matches the original LR or is a valid
-            // code address different from the fault address — that's the saved LR
-            // of the caller's frame, which breaks the loop.
-            Address fault_pc = emuenv.kernel.mono_exception_fault_pc;
-            Address escape_pc = 0;
-            Address escape_sp = original_sp;
-
-            for (int i = 2; i < 48; i++) {
-                Address stack_addr = original_sp + i * 4;
-                Ptr<uint32_t> sptr(stack_addr);
-                if (!sptr.valid(emuenv.mem))
-                    break;
-                uint32_t val = *sptr.get(emuenv.mem);
-
-                // Skip the fault address itself and null
-                if (val == 0 || val == fault_pc || val == original_lr)
-                    continue;
-
-                // Look for a code address in module range (0x80010000-0x8FFFFFFF)
-                if (val >= 0x80010000 && val < 0x90000000) {
-                    Ptr<uint32_t> code_check(val);
-                    if (code_check.valid(emuenv.mem)) {
-                        escape_pc = val;
-                        escape_sp = stack_addr + 4;
-                        break;
-                    }
-                }
-            }
-
-            if (escape_pc != 0) {
-                LOG_WARN("  SetCtx: Mono exception NULL (count={}) — stack escape to PC=0x{:08X}, SP=0x{:08X}",
-                         emuenv.kernel.mono_exception_null_count, escape_pc, escape_sp);
+            const ThreadStatePtr t = emuenv.kernel.get_thread(threadId);
+            if (t) {
+                LOG_WARN("  SetCtx: Mono exception NULL (count={}) — halting thread {} (same as abort)",
+                         emuenv.kernel.mono_exception_null_count, threadId);
                 infoCpu->reg[0] = 0;
-                infoCpu->reg[13] = escape_sp;
-                infoCpu->reg[15] = escape_pc;
-            } else {
-                // No escape found — use halt instruction to stop the thread cleanly
-                LOG_ERROR("  SetCtx: Mono exception NULL (count={}) — no stack escape found",
-                          emuenv.kernel.mono_exception_null_count);
-                const ThreadStatePtr t = emuenv.kernel.get_thread(threadId);
-                if (t) {
-                    infoCpu->reg[0] = 0;
-                    infoCpu->reg[13] = original_sp;
-                    infoCpu->reg[15] = t->cpu->halt_instruction_pc;
-                }
+                infoCpu->reg[15] = t->cpu->halt_instruction_pc;
             }
         } else if (infoCpu->reg[0] != 0) {
-            // Successful exception — reset counter
             emuenv.kernel.mono_exception_null_count = 0;
         }
 
