@@ -275,6 +275,11 @@ bool ThreadState::run_loop() {
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
+                    // After SVC, registers are flushed to regs[] — update the
+                    // Mono snapshot so it's at most one basic block stale.
+                    if (name.find("Mono") != std::string::npos) {
+                        cpu->pre_run_context = save_context(*cpu);
+                    }
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
 

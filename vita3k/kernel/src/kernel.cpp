@@ -184,6 +184,12 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
     if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
         return nullptr;
+
+    // Mark Mono threads so the JIT inserts per-block context saves
+    if (std::string(name).find("Mono") != std::string::npos) {
+        thread->cpu->use_mono_scheduling = true;
+    }
+
     const auto lock = std::lock_guard(mutex);
     threads.emplace(thread->id, thread);
 

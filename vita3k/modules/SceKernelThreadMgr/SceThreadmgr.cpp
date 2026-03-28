@@ -457,6 +457,28 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         context = save_context(*thread->cpu);
     }
 
+    // Diagnostic: log all registers we're returning to the Mono callback
+    if (using_saved) {
+        LOG_WARN("GetCtx for Mono: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+                 context.cpu_registers[0], context.cpu_registers[1],
+                 context.cpu_registers[2], context.cpu_registers[3]);
+        LOG_WARN("GetCtx for Mono: r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
+                 context.cpu_registers[4], context.cpu_registers[5],
+                 context.cpu_registers[6], context.cpu_registers[7]);
+        LOG_WARN("GetCtx for Mono: r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X}",
+                 context.cpu_registers[8], context.cpu_registers[9],
+                 context.cpu_registers[10], context.cpu_registers[11]);
+        LOG_WARN("GetCtx for Mono: r12=0x{:08X} SP=0x{:08X} LR=0x{:08X} PC=0x{:08X} CPSR=0x{:08X}",
+                 context.cpu_registers[12], context.cpu_registers[13],
+                 context.cpu_registers[14], context.cpu_registers[15], context.cpsr);
+
+        // Also log what the live context looks like (for comparison)
+        CPUContext live = save_context(*thread->cpu);
+        LOG_WARN("GetCtx LIVE ctx: r0=0x{:08X} SP=0x{:08X} LR=0x{:08X} PC=0x{:08X}",
+                 live.cpu_registers[0], live.cpu_registers[13],
+                 live.cpu_registers[14], live.cpu_registers[15]);
+    }
+
     SceKernelThreadCpuRegisterInfo *infoCpu = pCpuRegisterInfo.get(emuenv.mem);
     if (infoCpu) {
         if (infoCpu->size != sizeof(*infoCpu))
@@ -687,6 +709,34 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         uint32_t new_pc = infoCpu->reg[15];
         LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
                  threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
+
+        // Diagnostic: dump every register that the Mono callback modified
+        for (int i = 0; i < 16; i++) {
+            if (old_ctx.cpu_registers[i] != infoCpu->reg[i]) {
+                LOG_WARN("  SetCtx DIFF r{}: 0x{:08X} -> 0x{:08X}", i,
+                         old_ctx.cpu_registers[i], infoCpu->reg[i]);
+            }
+        }
+        // Check if r0 points to valid memory (trampoline needs this as context ptr)
+        {
+            Ptr<uint32_t> r0_check(infoCpu->reg[0]);
+            if (!r0_check.valid(emuenv.mem)) {
+                LOG_ERROR("  SetCtx WARNING: new r0=0x{:08X} is INVALID memory!", infoCpu->reg[0]);
+            } else {
+                // Dump first 8 words at r0 to see the exception context
+                uint32_t *r0_data = r0_check.get(emuenv.mem);
+                LOG_WARN("  SetCtx r0 data: [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                         r0_data[0], r0_data[1], r0_data[2], r0_data[3],
+                         r0_data[4], r0_data[5], r0_data[6], r0_data[7]);
+            }
+        }
+        // Check SP validity
+        {
+            Ptr<uint32_t> sp_check(infoCpu->reg[13]);
+            if (!sp_check.valid(emuenv.mem)) {
+                LOG_ERROR("  SetCtx WARNING: new SP=0x{:08X} is INVALID!", infoCpu->reg[13]);
+            }
+        }
 
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
         old_ctx.cpsr = infoCpu->cpsr;

@@ -95,17 +95,26 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
 
     LOG_WARN("signal_mono_exception: thread {}, fault_pc=0x{:08X}", thread_id, fault_pc);
 
-    // Use the pre-run context (saved before run() in the run_loop).
-    // This is a clean snapshot from before the faulting JIT block executed.
-    // The live context is corrupted because Dynarmic partially executed the block
-    // (NOPs, zero reads) before the callback could stop it.
+    // Use the LIVE context from jit->Regs().
+    // Dynarmic ARM64 backend stores guest registers directly in JitState.regs[]
+    // (via STR on every A32SetRegister IR op), so r0-r14 are accurate during
+    // MemoryRead/MemoryReadCode callbacks. Only r15 (PC) is stale — it's set
+    // at block exit, not per-instruction. We override it with fault_pc.
+    //
+    // Previous approach used pre_run_context (saved before run()) which was
+    // potentially hundreds of basic blocks stale — that caused the re-fault
+    // because the Mono callback received wrong r0/SP/LR values.
     auto faulting_thread = kernel->get_thread(thread_id);
     if (faulting_thread) {
         {
             std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
-            kernel->mono_exception_saved_context = faulting_thread->cpu->pre_run_context;
-            // Override PC with the actual fault PC
+            kernel->mono_exception_saved_context = save_context(*faulting_thread->cpu);
+            // Override PC with the actual fault PC (regs[15] only updated at block exit)
             kernel->mono_exception_saved_context.cpu_registers[15] = fault_pc;
+            LOG_WARN("signal_mono_exception: saved LIVE context r0=0x{:08X} SP=0x{:08X} LR=0x{:08X}",
+                     kernel->mono_exception_saved_context.cpu_registers[0],
+                     kernel->mono_exception_saved_context.cpu_registers[13],
+                     kernel->mono_exception_saved_context.cpu_registers[14]);
         }
         faulting_thread->suspend();
     }
