@@ -95,6 +95,7 @@ typedef std::map<uint32_t, uint32_t> ModuleUidByNid;
 
 struct KernelState {
     KernelState();
+    ~KernelState();
 
     std::mutex mutex;
     CodecEngineBlocks codec_blocks;
@@ -158,6 +159,9 @@ struct KernelState {
 
     // Serializes Mono worker thread execution to prevent race conditions.
     std::mutex mono_thread_mutex;
+    std::atomic<ThreadState *> mono_active_thread{nullptr}; // thread currently holding mono_thread_mutex in run()
+    std::thread mono_preemption_timer;
+    std::atomic<bool> mono_preemption_running{false};
 
     // Mono exception handler mechanism:
     // On real Vita, when a thread hits a null pointer / illegal access, the kernel

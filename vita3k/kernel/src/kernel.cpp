@@ -126,6 +126,13 @@ KernelState::KernelState()
     : debugger(*this) {
 }
 
+KernelState::~KernelState() {
+    mono_preemption_running = false;
+    if (mono_preemption_timer.joinable()) {
+        mono_preemption_timer.join();
+    }
+}
+
 bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt) {
     constexpr std::size_t MAX_CORE_COUNT = 150;
 
@@ -135,6 +142,20 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     base_tick = { rtc_base_ticks() };
     cpu_protocol = std::make_unique<CPUProtocol>(*this, mem, call_import);
     this->cpu_opt = cpu_opt;
+
+    // Start Mono preemption timer — forces run() to return every ~2ms
+    // for threads holding the mono_thread_mutex. This breaks spin-waits
+    // without needing enable_cycle_counting.
+    mono_preemption_running = true;
+    mono_preemption_timer = std::thread([this]() {
+        while (mono_preemption_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ThreadState *active = mono_active_thread.load();
+            if (active && active->cpu) {
+                halt_execution(*active->cpu);
+            }
+        }
+    });
 
     return true;
 }
