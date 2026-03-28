@@ -99,8 +99,6 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     cpu_protocol = std::make_unique<CPUProtocol>(*this, mem, call_import);
     this->cpu_opt = cpu_opt;
 
-    start_preemption_timer();
-
     return true;
 }
 

@@ -410,24 +410,10 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {
-        if (parent->use_mono_scheduling) {
-            ticks_remaining -= static_cast<int64_t>(ticks);
-        }
-    }
+    void AddTicks(uint64_t ticks) override {}
 
     uint64_t GetTicksRemaining() override {
-        if (parent->use_mono_scheduling) {
-            return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
-        }
         return 1ull << 60;
-    }
-
-    static constexpr int64_t SCHED_QUANTUM = 333000; // ~1ms at 333MHz
-    int64_t ticks_remaining = SCHED_QUANTUM;
-
-    void reset_ticks() {
-        ticks_remaining = SCHED_QUANTUM;
     }
 };
 
@@ -442,10 +428,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    // Must be true globally for Dynarmic to call AddTicks/GetTicksRemaining.
-    // Non-scheduled threads return 1<<60 ticks (effectively infinite = no overhead).
-    // Scheduled threads get a real quantum so run() returns periodically.
-    config.enable_cycle_counting = true;
+    config.enable_cycle_counting = false;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
@@ -472,9 +455,6 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     cb->mono_exception_signaled = false;
-    if (parent->use_mono_scheduling) {
-        cb->reset_ticks();
-    }
     Dynarmic::HaltReason halt_reason;
     do {
         halt_reason = jit->Run();

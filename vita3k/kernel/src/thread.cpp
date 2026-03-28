@@ -270,37 +270,26 @@ bool ThreadState::run_loop() {
             // - A background timer thread calls halt_execution() every ~1ms
             //   on the active thread, forcing run() to return (preemption).
             // - No cycle counting = zero JIT overhead.
-            // - Other threads run freely with no scheduling overhead.
+            // Event-driven Mono thread serialization.
+            //
+            // Like the real Vita kernel: threads switch at syscall boundaries.
+            // The mutex is held during guest code execution (run()) and released
+            // when the thread makes a kernel call (SVC). This is zero overhead:
+            // no cycle counting, no timer thread, no quantum.
+            //
+            // Only Mono threads are serialized. All other threads run freely.
+            //
+            // With enable_cycle_counting=false, run() returns only on SVC or
+            // halt — exactly when the real Vita kernel would context-switch.
             {
-            const bool is_mono = (name.find("Mono") != std::string::npos);
-            // Only Mono threads are scheduled (on virtual core 3).
-            // All other threads (Unity, system, etc.) run freely.
-            const int sched_core = is_mono ? 3 : -1;
-            const bool is_scheduled = is_mono;
+            const bool is_mono_thread = (name.find("Mono") != std::string::npos);
 
-            // Get shared_ptr to ourselves for the timer thread to access
-            auto self = is_scheduled ? kernel.get_thread(id) : nullptr;
-
-            auto sched_acquire = [&]() {
-                if (!is_scheduled) return;
-                std::unique_lock<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
-                kernel.core_sched_cv[sched_core].wait(slock, [&]() {
-                    return kernel.core_active_thread[sched_core] == nullptr;
-                });
-                kernel.core_active_thread[sched_core] = self;
-            };
-
-            auto sched_release = [&]() {
-                if (!is_scheduled) return;
-                std::lock_guard<std::mutex> slock(kernel.core_sched_mutex[sched_core]);
-                kernel.core_active_thread[sched_core] = nullptr;
-                kernel.core_sched_cv[sched_core].notify_all();
-            };
+            if (is_mono_thread) {
+                kernel.mono_thread_mutex.lock();
+            }
 
             // Run the cpu
             do {
-                sched_acquire();
-
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
@@ -308,14 +297,24 @@ bool ThreadState::run_loop() {
                     res = run(*cpu);
                 }
 
-                sched_release();
-
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
+                    // Release mutex at SVC boundary — this is where the real
+                    // Vita kernel would potentially context-switch.
+                    if (is_mono_thread) {
+                        kernel.mono_thread_mutex.unlock();
+                    }
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
+                    if (is_mono_thread) {
+                        kernel.mono_thread_mutex.lock();
+                    }
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
-            } // end scheduling block
+
+            if (is_mono_thread) {
+                kernel.mono_thread_mutex.unlock();
+            }
+            } // end mono serialization block
 
             lock.lock();
 
