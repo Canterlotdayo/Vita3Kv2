@@ -205,9 +205,22 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
         constexpr uint32_t GC_ENTRY_SIZE = 0x24; // 36 bytes
 
         Address ep = entry_point.address();
-        uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
         Address stack_bottom = thread->stack_top() - stack_size;
         Address stack_top_addr = thread->stack_top();
+
+        // The Mono GC callback searches by pthread_self return value (pthread_t),
+        // NOT by SceUID. The game's pthread.suprx returns a pointer to the
+        // pthread struct as the thread handle. This value appears as the hex
+        // prefix in thread names like "8BC449B0 Mono".
+        // Extract it from the name; fall back to SceUID if parsing fails.
+        uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
+        if (name) {
+            char *end = nullptr;
+            unsigned long parsed = strtoul(name, &end, 16);
+            if (end != name && *end == ' ' && parsed > 0x80000000) {
+                thread_id_val = static_cast<uint32_t>(parsed);
+            }
+        }
 
         // --- GC Hash Table Registration ---
         Address hash_table_addr = mono_data_start + GC_HASH_TABLE_OFFSET;
@@ -245,8 +258,8 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
                 table[idx] = exc_entry;
                 *counter = idx + 1;
             }
-            LOG_INFO("Mono GC: registered '{}' (ID:{}) in GC hash + exception table (idx={})",
-                     name, thread->id, idx);
+            LOG_INFO("Mono GC: registered '{}' (ID:{}, pthread_t=0x{:08X}) in exception table (idx={})",
+                     name, thread->id, thread_id_val, idx);
         } else {
             LOG_WARN("Mono GC: skipping exception table for '{}' (ID:{}) — counter={} (not initialized yet)",
                      name, thread->id, idx);
