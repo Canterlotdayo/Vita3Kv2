@@ -137,10 +137,7 @@ public:
             // DON'T fall through to the NOP fallback — that corrupts the thread.
             // On real Vita, each thread's exception is handled independently.
             // We must wait for the pending exception to be processed, then retry.
-            if (parent->protocol && parent->protocol->kernel->mono_code_start != 0) {
-                // Spin-wait until we can signal. The ExceptionHandlerThread is
-                // processing another exception; once it calls ResumeThreadForMono
-                // and goes back to WaitExceptionForMono, pending becomes false.
+            if (parent->protocol) {
                 int wait_count = 0;
                 while (true) {
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
