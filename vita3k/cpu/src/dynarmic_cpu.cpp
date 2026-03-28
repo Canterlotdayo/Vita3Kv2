@@ -207,10 +207,21 @@ public:
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
+            // This is typically a null function pointer call (C# NullReferenceException).
+            // Try to signal the Mono exception handler to redirect execution.
             {
                 Ptr<uint32_t> pc_check{ static_cast<uint32_t>(pc) };
                 if (pc && !pc_check.valid(*parent->mem)) {
-                    LOG_WARN("Thread executing in unmapped memory (PC=0x{:X}) - halting", pc);
+                    if (!mono_exception_signaled) {
+                        if (parent->protocol &&
+                            parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                            LOG_WARN("Thread at unmapped PC=0x{:X} — signaled Mono exception handler", pc);
+                            mono_exception_signaled = true;
+                            cpu->jit->HaltExecution();
+                            return 0;
+                        }
+                        LOG_WARN("Thread executing in unmapped memory (PC=0x{:X}) - halting", pc);
+                    }
                     cpu->jit->HaltExecution();
                     return 0;
                 }
