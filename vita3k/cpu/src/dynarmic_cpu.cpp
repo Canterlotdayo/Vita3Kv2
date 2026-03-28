@@ -191,16 +191,27 @@ public:
             if (mono_exception_signaled) {
                 mono_suspend_read_count++;
                 if (mono_suspend_read_count > 64) {
-                    // Thread was resumed but re-faulted. Reset and re-signal.
+                    // Thread was resumed but re-faulted. Try to re-signal,
+                    // but only if the handler has finished processing the
+                    // previous exception (pending == false).
                     auto pc = this->cpu->get_pc();
-                    mono_exception_signaled = false;
                     mono_suspend_read_count = 0;
-                    if (parent->protocol &&
-                        parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
-                        LOG_WARN("Re-signaling Mono exception for thread (PC=0x{:X}, addr=0x{:X})", pc, addr);
+                    
+                    // Check if handler is ready for a new signal
+                    bool handler_ready = false;
+                    if (parent->protocol) {
+                        // signal_mono_exception checks pending internally —
+                        // if pending is true, it returns false (BLOCKED).
+                        // We just try and reset only on success.
+                        mono_exception_signaled = false;
+                        if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                            LOG_WARN("Re-signaling Mono exception for thread (PC=0x{:X}, addr=0x{:X})", pc, addr);
+                            mono_exception_signaled = true;
+                            cpu->jit->HaltExecution();
+                            return 0;
+                        }
+                        // Handler not ready yet — keep waiting
                         mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return 0;
                     }
                 }
                 return 0;
