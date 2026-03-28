@@ -173,7 +173,7 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
                 *counter = count + 1;
 
                 LOG_WARN("Mono exception table: registered faulting thread '{}' (pthread_t=0x{:08X}) at idx={}",
-                         tname, pthread_id, count);
+                         faulting_thread->name, pthread_id, count);
             }
         }
     }
