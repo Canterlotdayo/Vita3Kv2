@@ -153,16 +153,18 @@ struct KernelState {
     // guest thread on its own host thread, causing true parallelism and race
     // conditions in guest code that assumes single-core cooperative scheduling.
     // These mutexes + cycle-limited execution emulate per-core time slicing.
-    static constexpr int NUM_CORES = 3; // user cores: 0x10000, 0x20000, 0x40000
+    static constexpr int NUM_CORES = 4; // 0-2: user cores (0x10000, 0x20000, 0x40000), 3: Mono virtual core
 
     // Per-core preemptive scheduler with timer-based preemption.
     //
     // A background timer thread calls halt_execution() on the active thread
     // of each core every ~1ms, forcing run() to return. This gives other
-    // threads a chance to acquire the core. No cycle counting needed.
+    // threads a chance to acquire the core.
     //
-    // Only threads with explicit CPU affinity are scheduled. Threads with
-    // default affinity (0) run freely with zero overhead.
+    // Cores 0-2: threads with explicit single-core affinity.
+    // Core 3: virtual core for Mono threads (prevents them from competing
+    //          with Unity threads on cores 0-2).
+    // Threads with default/multi-core affinity (except Mono): run freely.
     std::mutex core_sched_mutex[NUM_CORES];
     std::condition_variable core_sched_cv[NUM_CORES];
     std::shared_ptr<ThreadState> core_active_thread[NUM_CORES]; // currently running
