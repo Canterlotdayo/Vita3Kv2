@@ -259,45 +259,17 @@ bool ThreadState::run_loop() {
                 }
             }
 
-            // Mono thread serialization with timer-based preemption.
-            //
-            // Mono threads acquire a shared mutex before run(). A background
-            // timer thread calls halt_execution() on the active thread every ~2ms.
-            // When run() returns (from halt, SVC, or completion), the thread
-            // yields the mutex so another Mono thread can run.
-            //
-            // enable_cycle_counting stays false — zero JIT overhead.
-            // HaltExecution() works regardless of cycle counting.
-            // The yield between run() calls prevents deadlock on spin-waits:
-            // even if a Mono thread spins without SVC, HaltExecution() forces
-            // run() to return, then the mutex is released.
-            {
-            const bool is_mono_thread = (name.find("Mono") != std::string::npos);
-
             // Run the cpu
             do {
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.lock();
-                    // Register as active thread for timer preemption
-                    kernel.mono_active_thread.store(this);
-                }
-
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
                 } else {
                     // Save context before run() for Mono exception recovery.
-                    if (is_mono_thread) {
+                    if (name.find("Mono") != std::string::npos) {
                         cpu->pre_run_context = save_context(*cpu);
                     }
                     res = run(*cpu);
-                }
-
-                if (is_mono_thread) {
-                    kernel.mono_active_thread.store(nullptr);
-                    kernel.mono_thread_mutex.unlock();
-                    // Yield to let other Mono threads acquire the mutex
-                    std::this_thread::yield();
                 }
 
                 // handle svc call if this was what stopped the cpu
@@ -305,7 +277,6 @@ bool ThreadState::run_loop() {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
-            } // end mono serialization
 
             lock.lock();
 
