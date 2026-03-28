@@ -116,8 +116,19 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
              tname, thread_id, param1, param2, pc, lr);
 
     if (thread && thread->name.find("Mono") != std::string::npos) {
-        LOG_ERROR("AbortHandler: Mono thread {} — NOT killing, returning 0", thread_id);
-        return 0;
+        // Don't kill the thread (corrupts Mono runtime) and don't return
+        // (abort() chain would corrupt state). Instead, put the thread to
+        // sleep forever. It stays alive in the thread list but never executes
+        // again. This is safe because Mono spawns worker threads as needed.
+        LOG_ERROR("AbortHandler: Mono thread {} — suspending forever", thread_id);
+        thread->suspend();
+        // Block this host thread forever (the guest thread is suspended,
+        // but we need to prevent returning to the abort() chain)
+        std::mutex wait_mutex;
+        std::condition_variable wait_cv;
+        std::unique_lock<std::mutex> lock(wait_mutex);
+        wait_cv.wait(lock, []() { return false; }); // never wakes
+        return 0; // unreachable
     }
 
     if (thread) {
