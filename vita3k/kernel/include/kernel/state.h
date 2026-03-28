@@ -177,6 +177,8 @@ struct KernelState {
     Address mono_exception_fault_addr = 0;     // address that caused the fault
     Address mono_exception_fault_pc = 0;       // PC at time of fault
     CPUContext mono_exception_saved_context;    // full CPU context at time of fault
+    int mono_exception_null_count = 0;         // consecutive failed exceptions (r0=0) for same thread
+    int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
 
     uint64_t start_tick;
     SceRtcTick base_tick;
