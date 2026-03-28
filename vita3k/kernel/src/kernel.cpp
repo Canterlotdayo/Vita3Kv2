@@ -30,6 +30,18 @@
 
 #include <SDL3/SDL_mutex.h>
 
+#include <thread>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+
 int CorenumAllocator::new_corenum() {
     const std::lock_guard<std::mutex> guard(lock);
 
@@ -54,6 +66,25 @@ struct ThreadParams {
     SDL_Semaphore *host_may_destroy_params = nullptr;
 };
 
+// Pin the current host thread to a specific OS core.
+// Threads pinned to the same core are naturally time-sliced by the OS kernel
+// via hardware timer interrupt — no cycle counting or mutex needed.
+static void pin_thread_to_core(int core_id) {
+#if defined(__APPLE__)
+    thread_affinity_policy_data_t policy = { core_id + 1 };
+    thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_AFFINITY_POLICY,
+                      (thread_policy_t)&policy, 1);
+#elif defined(__linux__)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id % std::thread::hardware_concurrency(), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#elif defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), 1ULL << (core_id % 64));
+#endif
+}
+
 static int SDLCALL thread_function(void *data) {
     assert(data != nullptr);
     const ThreadParams params = *static_cast<const ThreadParams *>(data);
@@ -68,10 +99,16 @@ static int SDLCALL thread_function(void *data) {
     }
 #endif
 
+    // Pin Mono threads to the same OS core so the OS kernel time-slices them.
+    // This prevents the parallelism that causes race conditions in mono_class_init
+    // without any Dynarmic cycle counting overhead.
+    if (thread->name.find("Mono") != std::string::npos) {
+        pin_thread_to_core(0);
+    }
+
     try {
         thread->run_loop();
     } catch (const std::system_error &e) {
-        // macOS bug: pthread_cond_wait sporadically returns EINVAL
         LOG_ERROR("Thread {} (ID: {}) caught system_error: {}", thread->name, thread->id, e.what());
     } catch (const std::exception &e) {
         LOG_ERROR("Thread {} (ID: {}) caught exception: {}", thread->name, thread->id, e.what());

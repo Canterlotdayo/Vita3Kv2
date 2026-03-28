@@ -38,12 +38,11 @@ SceUID get_thread_id(CPUState &state) {
     return state.thread_id;
 }
 
-CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol, bool enable_scheduling) {
+CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol) {
     CPUStatePtr state(new CPUState(), delete_cpu_state);
     state->mem = &mem;
     state->protocol = protocol;
     state->thread_id = thread_id;
-    state->use_mono_scheduling = enable_scheduling;
 
     // TODO: we can move this to kernel after we drop unicorn
     state->halt_instruction = alloc_block(mem, 4, "halt_instruction");

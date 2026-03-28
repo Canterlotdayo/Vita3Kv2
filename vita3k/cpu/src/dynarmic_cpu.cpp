@@ -434,19 +434,10 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {
-        ticks_remaining -= static_cast<int64_t>(ticks);
-    }
+    void AddTicks(uint64_t ticks) override {}
 
     uint64_t GetTicksRemaining() override {
-        return static_cast<uint64_t>(std::max<int64_t>(ticks_remaining, 0));
-    }
-
-    static constexpr int64_t SCHED_QUANTUM = 333000; // ~1ms at 333MHz
-    int64_t ticks_remaining = SCHED_QUANTUM;
-
-    void reset_ticks() {
-        ticks_remaining = SCHED_QUANTUM;
+        return 1ull << 60;
     }
 };
 
@@ -461,10 +452,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    // Per-JIT cycle counting: only Mono threads (use_mono_scheduling=true)
-    // get cycle counting for quantum-based preemption. All other threads
-    // have enable_cycle_counting=false — zero JIT overhead, full speed.
-    config.enable_cycle_counting = parent->use_mono_scheduling;
+    config.enable_cycle_counting = false;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
@@ -491,9 +479,6 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     cb->mono_exception_signaled = false;
-    if (parent->use_mono_scheduling) {
-        cb->reset_ticks();
-    }
     Dynarmic::HaltReason halt_reason;
     do {
         halt_reason = jit->Run();

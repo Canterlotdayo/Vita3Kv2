@@ -73,12 +73,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
 
-    // Determine if this thread needs scheduling (cycle counting + mutex).
-    // Must be set BEFORE init_cpu because make_jit reads use_mono_scheduling
-    // to decide whether to enable cycle counting in the JIT.
-    const bool needs_scheduling = (std::string(name).find("Mono") != std::string::npos);
-
-    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get(), needs_scheduling);
+    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get());
     if (!cpu) {
         return SCE_KERNEL_ERROR_ERROR;
     }
@@ -267,43 +262,17 @@ bool ThreadState::run_loop() {
             // Per-core preemptive scheduler with timer-based preemption.
             //
             // On the real Vita, threads sharing a CPU core are time-sliced.
-            // Only one thread runs per core at a time. We emulate this:
-            //
-            // - Threads with explicit single-core affinity are scheduled.
-            // - Mono threads are ALWAYS scheduled (on core 0 if no explicit
-            //   single-core affinity) to prevent race conditions in mono_class_init.
-            // - A background timer thread calls halt_execution() every ~1ms
-            //   on the active thread, forcing run() to return (preemption).
-            // - No cycle counting = zero JIT overhead.
-            // Per-quantum Mono mutex with cycle counting.
-            // Lock/run/unlock each quantum — allows limited parallelism between
-            // quanta while preventing most races. The rare "pending init" race
-            // is handled by the abort handler (returns 0, thread survives).
-            {
-            const bool is_mono_thread = (name.find("Mono") != std::string::npos);
-
             // Run the cpu
             do {
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.lock();
-                }
-
                 if (to_do == ThreadToDo::step) {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
                 } else {
                     // Save context before run() for Mono exception recovery.
-                    // If a fault happens during run(), the registers will be
-                    // corrupted by the time the handler reads them. This snapshot
-                    // gives us clean registers from before the faulting block.
-                    if (is_mono_thread) {
+                    if (name.find("Mono") != std::string::npos) {
                         cpu->pre_run_context = save_context(*cpu);
                     }
                     res = run(*cpu);
-                }
-
-                if (is_mono_thread) {
-                    kernel.mono_thread_mutex.unlock();
                 }
 
                 // handle svc call if this was what stopped the cpu
@@ -311,7 +280,6 @@ bool ThreadState::run_loop() {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
-            } // end mono serialization block
 
             lock.lock();
 
