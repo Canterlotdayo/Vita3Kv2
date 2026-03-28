@@ -32,16 +32,6 @@ EXPORT(int, sceKernelGetThreadContextForMono, SceUID threadId, Ptr<SceKernelThre
 
 EXPORT(int, sceKernelResumeThreadForMono, SceUID threadId) {
     TRACY_FUNC(sceKernelResumeThreadForMono, threadId);
-
-    // If the Mono exception callback failed to create an exception object (r0=0),
-    // don't resume the thread. It would just re-fault and loop forever.
-    // Leave it suspended — same behavior as sceKernelCallAbortHandler.
-    if (emuenv.kernel.mono_exception_skip_resume) {
-        LOG_WARN("sceKernelResumeThreadForMono: SKIPPING resume for thread {} (exception object was NULL)", threadId);
-        emuenv.kernel.mono_exception_skip_resume = false;
-        return SCE_KERNEL_OK;
-    }
-
     return CALL_EXPORT(sceKernelResumeThreadForVM, threadId);
 }
 

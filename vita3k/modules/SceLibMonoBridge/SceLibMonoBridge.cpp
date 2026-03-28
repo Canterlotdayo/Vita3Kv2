@@ -16,6 +16,14 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <module/module.h>
+#include <kernel/state.h>
+#include <kernel/thread/thread_state.h>
+#include <util/log.h>
+
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 EXPORT(int, __aeabi_unwind_cpp_pr0) {
     return UNIMPLEMENTED();
@@ -833,11 +841,11 @@ EXPORT(int, pss_get_win32_filetime) {
 }
 
 EXPORT(int, pss_getpagesize) {
-    return UNIMPLEMENTED();
+    return 4096; // Vita page size
 }
 
 EXPORT(int, pss_getpid) {
-    return UNIMPLEMENTED();
+    return 1; // Return a dummy PID
 }
 
 EXPORT(int, pss_gettimeofday) {
@@ -1033,7 +1041,8 @@ EXPORT(int, pss_signal_semaphore) {
 }
 
 EXPORT(int, pss_supports_fast_tls) {
-    return UNIMPLEMENTED();
+    // Return 0 = no fast TLS. Mono will use pthread TLS instead.
+    return 0;
 }
 
 EXPORT(int, pss_suspend_thread) {
@@ -1041,7 +1050,8 @@ EXPORT(int, pss_suspend_thread) {
 }
 
 EXPORT(int, pss_threads_initialize) {
-    return UNIMPLEMENTED();
+    LOG_INFO("pss_threads_initialize called");
+    return 0;
 }
 
 EXPORT(int, pss_usb_transport_close1) {
@@ -1069,135 +1079,341 @@ EXPORT(int, pss_wait_semaphore) {
 }
 
 EXPORT(int, pthread_attr_init) {
-    return UNIMPLEMENTED();
+    // Guest passes a pointer to pthread_attr_t struct. Just zero-init it.
+    return 0; // success
 }
 
 EXPORT(int, pthread_attr_setstacksize) {
-    return UNIMPLEMENTED();
+    // Ignore — Vita3K manages stack sizes via sceKernelCreateThread
+    return 0;
 }
 
 EXPORT(int, pthread_cleanup_pop_) {
-    return UNIMPLEMENTED();
+    return 0;
 }
 
 EXPORT(int, pthread_cleanup_push_) {
-    return UNIMPLEMENTED();
+    return 0;
 }
 
-EXPORT(int, pthread_cond_broadcast) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_cond_broadcast, uint32_t *cond) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.cond_map_mutex);
+    uint32_t key = cond ? *cond : 0;
+    auto it = ps.condvars.find(key);
+    if (it != ps.condvars.end()) {
+        it->second->cv.notify_all();
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_cond_destroy) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_cond_destroy, uint32_t *cond) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.cond_map_mutex);
+    if (cond) {
+        ps.condvars.erase(*cond);
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_cond_init) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_cond_init, uint32_t *cond, void *attr) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.cond_map_mutex);
+    static uint32_t next_cond_id = 1;
+    uint32_t id = next_cond_id++;
+    ps.condvars[id] = std::make_shared<KernelState::PthreadState::CondVar>();
+    if (cond) *cond = id;
+    return 0;
 }
 
-EXPORT(int, pthread_cond_signal) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_cond_signal, uint32_t *cond) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.cond_map_mutex);
+    uint32_t key = cond ? *cond : 0;
+    auto it = ps.condvars.find(key);
+    if (it != ps.condvars.end()) {
+        it->second->cv.notify_one();
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_cond_timedwait) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_cond_timedwait, uint32_t *cond, uint32_t *mutex_guest, void *abstime) {
+    auto &ps = emuenv.kernel.pthread;
+    uint32_t cond_key = cond ? *cond : 0;
+    uint32_t mutex_key = mutex_guest ? *mutex_guest : 0;
+
+    std::shared_ptr<KernelState::PthreadState::CondVar> cv;
+    std::shared_ptr<std::recursive_mutex> mtx;
+    {
+        std::lock_guard<std::mutex> lock(ps.cond_map_mutex);
+        auto it = ps.condvars.find(cond_key);
+        if (it != ps.condvars.end()) cv = it->second;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        auto it = ps.mutexes.find(mutex_key);
+        if (it != ps.mutexes.end()) mtx = it->second;
+    }
+    if (cv && mtx) {
+        cv->cv.wait_for(*mtx, std::chrono::milliseconds(100));
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_cond_wait) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_cond_wait, uint32_t *cond, uint32_t *mutex_guest) {
+    auto &ps = emuenv.kernel.pthread;
+    uint32_t cond_key = cond ? *cond : 0;
+    uint32_t mutex_key = mutex_guest ? *mutex_guest : 0;
+
+    std::shared_ptr<KernelState::PthreadState::CondVar> cv;
+    std::shared_ptr<std::recursive_mutex> mtx;
+    {
+        std::lock_guard<std::mutex> lock(ps.cond_map_mutex);
+        auto it = ps.condvars.find(cond_key);
+        if (it != ps.condvars.end()) cv = it->second;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        auto it = ps.mutexes.find(mutex_key);
+        if (it != ps.mutexes.end()) mtx = it->second;
+    }
+    if (cv && mtx) {
+        cv->cv.wait(*mtx);
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_create) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_create, uint32_t *thread_out, void *attr, Ptr<void> start_routine, Ptr<void> arg) {
+    // Mono creates worker threads via pthread_create.
+    // We create a Vita thread with entry_point = start_routine,
+    // then start it with r0 = arg (the void* parameter).
+    const auto entry = Ptr<const void>(start_routine.address());
+    constexpr int stack_size = 0x10000; // 64KB
+    constexpr int priority = 0xA0;
+
+    auto thread = emuenv.kernel.create_thread(emuenv.mem, "MonoPthread", entry,
+                                               priority, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+                                               stack_size, nullptr);
+    if (!thread) {
+        LOG_ERROR("pthread_create: create_thread failed");
+        return -1;
+    }
+
+    // Start the thread with r0 = arg address (pthread convention)
+    int ret = thread->start(static_cast<SceSize>(arg.address()), Ptr<void>(0), true);
+    if (ret < 0) {
+        LOG_ERROR("pthread_create: start failed: 0x{:X}", ret);
+        return -1;
+    }
+
+    if (thread_out) {
+        *thread_out = static_cast<uint32_t>(thread->id);
+    }
+    LOG_INFO("pthread_create: created thread MonoPthread (SceUID: {})", thread->id);
+    return 0;
 }
 
 EXPORT(int, pthread_detach) {
-    return UNIMPLEMENTED();
+    return 0; // All Vita threads are effectively detached
 }
 
-EXPORT(int, pthread_equal) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_equal, uint32_t t1, uint32_t t2) {
+    return t1 == t2 ? 1 : 0;
 }
 
 EXPORT(int, pthread_exit) {
-    return UNIMPLEMENTED();
+    // Thread exits — will be handled by run_loop returning
+    auto thread = emuenv.kernel.get_thread(thread_id);
+    if (thread) {
+        thread->exit(0);
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_getspecific) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_getspecific, int key) {
+    // Returns the TLS value (as int, which is actually a pointer).
+    // POSIX: returns NULL (0) if key not found or not set.
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.tls_mutex);
+    auto thread_it = ps.tls_data.find(thread_id);
+    if (thread_it != ps.tls_data.end()) {
+        auto key_it = thread_it->second.find(key);
+        if (key_it != thread_it->second.end()) {
+            return static_cast<int>(key_it->second);
+        }
+    }
+    return 0; // NULL — key not set for this thread
 }
 
-EXPORT(int, pthread_getspecific_for_thread) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_getspecific_for_thread, int key, SceUID target_thread_id) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.tls_mutex);
+    auto thread_it = ps.tls_data.find(target_thread_id);
+    if (thread_it != ps.tls_data.end()) {
+        auto key_it = thread_it->second.find(key);
+        if (key_it != thread_it->second.end()) {
+            return static_cast<int>(key_it->second);
+        }
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_join) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_join, uint32_t thread_handle, void *retval) {
+    auto thread = emuenv.kernel.get_thread(static_cast<SceUID>(thread_handle));
+    if (thread) {
+        std::unique_lock<std::mutex> lock(thread->mutex);
+        thread->something_to_do.wait(lock, [&] { return thread->status == ThreadStatus::dormant; });
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_key_create) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_key_create, int *key_out, Ptr<void> destructor) {
+    // POSIX: creates a new TLS key, stores it in *key_out
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.tls_mutex);
+
+    if (ps.next_key >= KernelState::PthreadState::MAX_KEYS) {
+        LOG_ERROR("pthread_key_create: too many TLS keys");
+        return -1; // EAGAIN
+    }
+
+    int key = ps.next_key++;
+    // Store destructor if provided (we don't call destructors yet but track them)
+    if (destructor.address()) {
+        ps.key_destructors[key] = reinterpret_cast<void(*)(void*)>(destructor.address());
+    }
+
+    if (key_out) {
+        *key_out = key;
+    }
+    LOG_INFO("pthread_key_create: created TLS key {}", key);
+    return 0; // success
 }
 
-EXPORT(int, pthread_key_delete) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_key_delete, int key) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.tls_mutex);
+    ps.key_destructors.erase(key);
+    // Remove from all threads
+    for (auto &t : ps.tls_data) {
+        t.second.erase(key);
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_mutex_destroy) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_mutex_destroy, uint32_t *mutex_guest) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+    if (mutex_guest) {
+        ps.mutexes.erase(*mutex_guest);
+    }
+    return 0;
 }
 
-EXPORT(int, pthread_mutex_init) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_mutex_init, uint32_t *mutex_guest, void *attr) {
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+    uint32_t id = ps.next_mutex_id++;
+    ps.mutexes[id] = std::make_shared<std::recursive_mutex>();
+    if (mutex_guest) *mutex_guest = id;
+    return 0;
 }
 
-EXPORT(int, pthread_mutex_lock) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_mutex_lock, uint32_t *mutex_guest) {
+    auto &ps = emuenv.kernel.pthread;
+    uint32_t key = mutex_guest ? *mutex_guest : 0;
+
+    // Auto-init static mutexes (PTHREAD_MUTEX_INITIALIZER = 0)
+    if (key == 0 && mutex_guest) {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        key = ps.next_mutex_id++;
+        ps.mutexes[key] = std::make_shared<std::recursive_mutex>();
+        *mutex_guest = key;
+    }
+
+    std::shared_ptr<std::recursive_mutex> mtx;
+    {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        auto it = ps.mutexes.find(key);
+        if (it != ps.mutexes.end()) mtx = it->second;
+    }
+    if (mtx) mtx->lock();
+    return 0;
 }
 
-EXPORT(int, pthread_mutex_trylock) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_mutex_trylock, uint32_t *mutex_guest) {
+    auto &ps = emuenv.kernel.pthread;
+    uint32_t key = mutex_guest ? *mutex_guest : 0;
+    if (key == 0 && mutex_guest) {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        key = ps.next_mutex_id++;
+        ps.mutexes[key] = std::make_shared<std::recursive_mutex>();
+        *mutex_guest = key;
+    }
+    std::shared_ptr<std::recursive_mutex> mtx;
+    {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        auto it = ps.mutexes.find(key);
+        if (it != ps.mutexes.end()) mtx = it->second;
+    }
+    if (mtx && mtx->try_lock()) return 0;
+    return 16; // EBUSY
 }
 
-EXPORT(int, pthread_mutex_unlock) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_mutex_unlock, uint32_t *mutex_guest) {
+    auto &ps = emuenv.kernel.pthread;
+    uint32_t key = mutex_guest ? *mutex_guest : 0;
+    std::shared_ptr<std::recursive_mutex> mtx;
+    {
+        std::lock_guard<std::mutex> lock(ps.mutex_map_mutex);
+        auto it = ps.mutexes.find(key);
+        if (it != ps.mutexes.end()) mtx = it->second;
+    }
+    if (mtx) mtx->unlock();
+    return 0;
 }
 
 EXPORT(int, pthread_mutexattr_destroy) {
-    return UNIMPLEMENTED();
+    return 0;
 }
 
 EXPORT(int, pthread_mutexattr_init) {
-    return UNIMPLEMENTED();
+    return 0;
 }
 
 EXPORT(int, pthread_mutexattr_settype) {
-    return UNIMPLEMENTED();
+    return 0; // We always use recursive mutexes
 }
 
 EXPORT(int, pthread_self) {
-    return UNIMPLEMENTED();
+    // Return the current thread's SceUID as the pthread handle
+    return static_cast<int>(thread_id);
 }
 
-EXPORT(int, pthread_setspecific) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_setspecific, int key, uint32_t value) {
+    // POSIX: sets the TLS value for the current thread
+    auto &ps = emuenv.kernel.pthread;
+    std::lock_guard<std::mutex> lock(ps.tls_mutex);
+    ps.tls_data[thread_id][key] = value;
+    return 0; // success
 }
 
-EXPORT(int, pthread_vita_tls_create_np) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_vita_tls_create_np, int *key_out, Ptr<void> destructor) {
+    // Vita-specific TLS — same as pthread_key_create
+    return export_pthread_key_create(emuenv, thread_id, export_name, key_out, destructor);
 }
 
-EXPORT(int, pthread_vita_tls_get_np) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_vita_tls_get_np, int key) {
+    return export_pthread_getspecific(emuenv, thread_id, export_name, key);
 }
 
-EXPORT(int, pthread_vita_tls_set_np) {
-    return UNIMPLEMENTED();
+EXPORT(int, pthread_vita_tls_set_np, int key, uint32_t value) {
+    return export_pthread_setspecific(emuenv, thread_id, export_name, key, value);
 }
 
 EXPORT(int, sched_yield) {
-    return UNIMPLEMENTED();
+    std::this_thread::yield();
+    return 0;
 }
 
 EXPORT(int, unlink) {

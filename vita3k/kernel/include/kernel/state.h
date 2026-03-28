@@ -34,8 +34,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
-#include <set>
 #include <thread>
 #include <vector>
 
@@ -179,10 +179,36 @@ struct KernelState {
     Address mono_exception_fault_addr = 0;     // address that caused the fault
     Address mono_exception_fault_pc = 0;       // PC at time of fault
     CPUContext mono_exception_saved_context;    // full CPU context at time of fault
-    int mono_exception_null_count = 0;         // consecutive failed exceptions (r0=0) for same thread
     int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
-    bool mono_exception_skip_resume = false;   // when true, ResumeThreadForMono skips the resume
-    std::set<SceUID> mono_exception_dead_threads; // threads permanently suspended (exception failed)
+
+    // Pthread implementation for SceLibMonoBridge (used by mono-vita.suprx).
+    // On real Vita, the pthread module provides POSIX threading on top of the
+    // Vita kernel. Mono uses pthread for TLS (thread-local storage), mutexes,
+    // condition variables, and thread management. Without working pthread,
+    // Mono can't register worker threads in the GC, causing exception handling
+    // to fail for those threads.
+    struct PthreadState {
+        // TLS (Thread Local Storage)
+        static constexpr int MAX_KEYS = 256;
+        std::mutex tls_mutex;
+        int next_key = 1;
+        std::map<int, void(*)(void*)> key_destructors;  // key → destructor function
+        std::map<SceUID, std::map<int, uint32_t>> tls_data;  // thread_id → (key → value)
+
+        // Mutex tracking (guest address → host mutex)
+        std::mutex mutex_map_mutex;
+        std::map<uint32_t, std::shared_ptr<std::recursive_mutex>> mutexes;  // guest_addr → mutex
+        int next_mutex_id = 1;
+
+        // Condition variable tracking
+        std::mutex cond_map_mutex;
+        struct CondVar {
+            std::condition_variable_any cv;
+        };
+        std::map<uint32_t, std::shared_ptr<CondVar>> condvars;  // guest_addr → condvar
+
+        // Thread handle mapping: SceUID → pthread_t (we use SceUID as pthread_t)
+    } pthread;
 
     uint64_t start_tick;
     SceRtcTick base_tick;
