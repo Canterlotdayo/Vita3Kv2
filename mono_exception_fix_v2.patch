@@ -1,0 +1,165 @@
+diff --git a/vita3k/kernel/src/cpu_protocol.cpp b/vita3k/kernel/src/cpu_protocol.cpp
+index f9241ec1..a069d035 100644
+--- a/vita3k/kernel/src/cpu_protocol.cpp
++++ b/vita3k/kernel/src/cpu_protocol.cpp
+@@ -95,17 +95,26 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
+ 
+     LOG_WARN("signal_mono_exception: thread {}, fault_pc=0x{:08X}", thread_id, fault_pc);
+ 
+-    // Use the pre-run context (saved before run() in the run_loop).
+-    // This is a clean snapshot from before the faulting JIT block executed.
+-    // The live context is corrupted because Dynarmic partially executed the block
+-    // (NOPs, zero reads) before the callback could stop it.
++    // Use the LIVE context from jit->Regs().
++    // Dynarmic ARM64 backend stores guest registers directly in JitState.regs[]
++    // (via STR on every A32SetRegister IR op), so r0-r14 are accurate during
++    // MemoryRead/MemoryReadCode callbacks. Only r15 (PC) is stale — it's set
++    // at block exit, not per-instruction. We override it with fault_pc.
++    //
++    // Previous approach used pre_run_context (saved before run()) which was
++    // potentially hundreds of basic blocks stale — that caused the re-fault
++    // because the Mono callback received wrong r0/SP/LR values.
+     auto faulting_thread = kernel->get_thread(thread_id);
+     if (faulting_thread) {
+         {
+             std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
+-            kernel->mono_exception_saved_context = faulting_thread->cpu->pre_run_context;
+-            // Override PC with the actual fault PC
++            kernel->mono_exception_saved_context = save_context(*faulting_thread->cpu);
++            // Override PC with the actual fault PC (regs[15] only updated at block exit)
+             kernel->mono_exception_saved_context.cpu_registers[15] = fault_pc;
++            LOG_WARN("signal_mono_exception: saved LIVE context r0=0x{:08X} SP=0x{:08X} LR=0x{:08X}",
++                     kernel->mono_exception_saved_context.cpu_registers[0],
++                     kernel->mono_exception_saved_context.cpu_registers[13],
++                     kernel->mono_exception_saved_context.cpu_registers[14]);
+         }
+         faulting_thread->suspend();
+     }
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index d870734e..cf6024ed 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -184,6 +184,12 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
+     ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
+     if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
+         return nullptr;
++
++    // Mark Mono threads so the JIT inserts per-block context saves
++    if (std::string(name).find("Mono") != std::string::npos) {
++        thread->cpu->use_mono_scheduling = true;
++    }
++
+     const auto lock = std::lock_guard(mutex);
+     threads.emplace(thread->id, thread);
+ 
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 7eeb03a1..fba2e218 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -275,6 +275,11 @@ bool ThreadState::run_loop() {
+                 // handle svc call if this was what stopped the cpu
+                 if (cpu->svc_called) {
+                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
++                    // After SVC, registers are flushed to regs[] — update the
++                    // Mono snapshot so it's at most one basic block stale.
++                    if (name.find("Mono") != std::string::npos) {
++                        cpu->pre_run_context = save_context(*cpu);
++                    }
+                 }
+             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index c69d7d8e..6953fa05 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -457,6 +457,28 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+         context = save_context(*thread->cpu);
+     }
+ 
++    // Diagnostic: log all registers we're returning to the Mono callback
++    if (using_saved) {
++        LOG_WARN("GetCtx for Mono: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
++                 context.cpu_registers[0], context.cpu_registers[1],
++                 context.cpu_registers[2], context.cpu_registers[3]);
++        LOG_WARN("GetCtx for Mono: r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
++                 context.cpu_registers[4], context.cpu_registers[5],
++                 context.cpu_registers[6], context.cpu_registers[7]);
++        LOG_WARN("GetCtx for Mono: r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X}",
++                 context.cpu_registers[8], context.cpu_registers[9],
++                 context.cpu_registers[10], context.cpu_registers[11]);
++        LOG_WARN("GetCtx for Mono: r12=0x{:08X} SP=0x{:08X} LR=0x{:08X} PC=0x{:08X} CPSR=0x{:08X}",
++                 context.cpu_registers[12], context.cpu_registers[13],
++                 context.cpu_registers[14], context.cpu_registers[15], context.cpsr);
++
++        // Also log what the live context looks like (for comparison)
++        CPUContext live = save_context(*thread->cpu);
++        LOG_WARN("GetCtx LIVE ctx: r0=0x{:08X} SP=0x{:08X} LR=0x{:08X} PC=0x{:08X}",
++                 live.cpu_registers[0], live.cpu_registers[13],
++                 live.cpu_registers[14], live.cpu_registers[15]);
++    }
++
+     SceKernelThreadCpuRegisterInfo *infoCpu = pCpuRegisterInfo.get(emuenv.mem);
+     if (infoCpu) {
+         if (infoCpu->size != sizeof(*infoCpu))
+@@ -688,6 +710,61 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+         LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
+                  threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
+ 
++        // Diagnostic: dump every register that the Mono callback modified
++        for (int i = 0; i < 16; i++) {
++            if (old_ctx.cpu_registers[i] != infoCpu->reg[i]) {
++                LOG_WARN("  SetCtx DIFF r{}: 0x{:08X} -> 0x{:08X}", i,
++                         old_ctx.cpu_registers[i], infoCpu->reg[i]);
++            }
++        }
++
++        // When Mono's exception callback fails to create an exception object
++        // (mono_get_exception returns NULL during class init), it sets r0=0
++        // and PC to a trampoline epilogue. That epilogue expects a stack frame
++        // that doesn't exist (the fault happened in JIT code, not inside the
++        // Mono wrapper function), so it would crash on the stack canary check
++        // and cascade into infinite re-faults.
++        //
++        // Fix: if r0=0 after the callback, skip the trampoline entirely.
++        // Instead, return to the original fault PC (now in LR, set by callback)
++        // with r0=0 — the C# code will see a null and either handle it or
++        // trigger a proper NullReferenceException later when the class is ready.
++        if (infoCpu->reg[0] == 0 && emuenv.kernel.mono_exception_thread_id == threadId) {
++            // The callback set: LR = original fault PC, PC = trampoline epilogue
++            // We want: PC = LR (return to caller of the faulting code), r0 = 0
++            Address original_lr = emuenv.kernel.mono_exception_saved_context.cpu_registers[14];
++            Address original_sp = emuenv.kernel.mono_exception_saved_context.cpu_registers[13];
++
++            LOG_WARN("  SetCtx: Mono exception object is NULL — skipping trampoline");
++            LOG_WARN("  SetCtx: restoring PC=0x{:08X} (original LR), SP=0x{:08X} (original SP)",
++                     original_lr, original_sp);
++
++            // Keep r0=0 but restore SP and set PC to original LR (return address)
++            infoCpu->reg[0] = 0;
++            infoCpu->reg[13] = original_sp;  // restore original SP
++            infoCpu->reg[15] = original_lr;  // return to caller
++        }
++
++        // Check if r0 points to valid memory (trampoline needs this as context ptr)
++        if (infoCpu->reg[0] != 0) {
++            Ptr<uint32_t> r0_check(infoCpu->reg[0]);
++            if (!r0_check.valid(emuenv.mem)) {
++                LOG_ERROR("  SetCtx WARNING: new r0=0x{:08X} is INVALID memory!", infoCpu->reg[0]);
++            } else {
++                uint32_t *r0_data = r0_check.get(emuenv.mem);
++                LOG_WARN("  SetCtx r0 data: [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
++                         r0_data[0], r0_data[1], r0_data[2], r0_data[3],
++                         r0_data[4], r0_data[5], r0_data[6], r0_data[7]);
++            }
++        }
++        // Check SP validity
++        {
++            Ptr<uint32_t> sp_check(infoCpu->reg[13]);
++            if (!sp_check.valid(emuenv.mem)) {
++                LOG_ERROR("  SetCtx WARNING: new SP=0x{:08X} is INVALID!", infoCpu->reg[13]);
++            }
++        }
++
+         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
+         old_ctx.cpsr = infoCpu->cpsr;
+         load_context(*thread->cpu, old_ctx);

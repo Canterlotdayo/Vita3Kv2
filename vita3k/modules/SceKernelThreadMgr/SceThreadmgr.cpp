@@ -717,13 +717,37 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
                          old_ctx.cpu_registers[i], infoCpu->reg[i]);
             }
         }
+
+        // When Mono's exception callback fails to create an exception object
+        // (mono_get_exception returns NULL during class init), it sets r0=0
+        // and PC to a trampoline epilogue. That epilogue expects a stack frame
+        // that doesn't exist (the fault happened in JIT code, not inside the
+        // Mono wrapper function), so it would crash on the stack canary check
+        // and cascade into infinite re-faults.
+        //
+        // Fix: if r0=0 after the callback, skip the trampoline entirely.
+        // Instead, return to the original fault PC (now in LR, set by callback)
+        // with r0=0 — the C# code will see a null and either handle it or
+        // trigger a proper NullReferenceException later when the class is ready.
+        if (infoCpu->reg[0] == 0 && emuenv.kernel.mono_exception_thread_id == threadId) {
+            Address original_lr = emuenv.kernel.mono_exception_saved_context.cpu_registers[14];
+            Address original_sp = emuenv.kernel.mono_exception_saved_context.cpu_registers[13];
+
+            LOG_WARN("  SetCtx: Mono exception object is NULL — skipping trampoline");
+            LOG_WARN("  SetCtx: restoring PC=0x{:08X} (original LR), SP=0x{:08X} (original SP)",
+                     original_lr, original_sp);
+
+            infoCpu->reg[0] = 0;
+            infoCpu->reg[13] = original_sp;
+            infoCpu->reg[15] = original_lr;
+        }
+
         // Check if r0 points to valid memory (trampoline needs this as context ptr)
-        {
+        if (infoCpu->reg[0] != 0) {
             Ptr<uint32_t> r0_check(infoCpu->reg[0]);
             if (!r0_check.valid(emuenv.mem)) {
                 LOG_ERROR("  SetCtx WARNING: new r0=0x{:08X} is INVALID memory!", infoCpu->reg[0]);
             } else {
-                // Dump first 8 words at r0 to see the exception context
                 uint32_t *r0_data = r0_check.get(emuenv.mem);
                 LOG_WARN("  SetCtx r0 data: [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
                          r0_data[0], r0_data[1], r0_data[2], r0_data[3],
