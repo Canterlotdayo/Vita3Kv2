@@ -113,7 +113,6 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
         // Only signal if no exception is already pending and handler is registered
         if (kernel->mono_exception_pending || kernel->mono_exception_handler_thread == 0
             || kernel->mono_exception_sema == 0) {
-            // Throttle: only log first 3 then every 10000th to avoid millions of log lines
             kernel->mono_exception_blocked_count++;
             if (kernel->mono_exception_blocked_count <= 3 || (kernel->mono_exception_blocked_count % 10000) == 0) {
                 LOG_WARN("signal_mono_exception BLOCKED (x{}): pending={}, handler={}, sema={}",
@@ -122,12 +121,21 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
             }
             return false;
         }
-        kernel->mono_exception_blocked_count = 0;
 
+        // Don't re-signal the same thread that was just processed.
+        // The wait-retry loop can re-signal after the handler finishes,
+        // but by then the thread's PC is stale (0x0). The original signal
+        // had the correct PC. Skip re-signaling to preserve the correct context.
+        if (kernel->mono_exception_last_thread == thread_id && fault_pc == 0) {
+            return false;
+        }
+
+        kernel->mono_exception_blocked_count = 0;
         kernel->mono_exception_pending = true;
         kernel->mono_exception_thread_id = thread_id;
         kernel->mono_exception_fault_addr = fault_addr;
         kernel->mono_exception_fault_pc = fault_pc;
+        kernel->mono_exception_last_thread = thread_id;
         sema = kernel->mono_exception_sema;
     }
 

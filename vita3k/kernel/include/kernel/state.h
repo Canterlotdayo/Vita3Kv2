@@ -183,6 +183,7 @@ struct KernelState {
     int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
     bool mono_exception_skip_resume = false;   // when true, ResumeThreadForMono skips the resume
     std::set<SceUID> mono_exception_dead_threads; // threads that died on double-fault (like real Vita)
+    SceUID mono_exception_last_thread = 0;     // last thread that signaled (prevents PC=0 re-signal)
 
     // Pthread implementation for SceLibMonoBridge (used by mono-vita.suprx).
     // On real Vita, the pthread module provides POSIX threading on top of the
