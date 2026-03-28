@@ -188,6 +188,50 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     // Mark Mono threads so the JIT inserts per-block context saves
     if (std::string(name).find("Mono") != std::string::npos) {
         thread->cpu->use_mono_scheduling = true;
+
+        // Register this thread in the Boehm GC hash table so the GC can
+        // suspend it during stop-the-world collection. Without this, the GC
+        // doesn't know about worker threads → collects objects they still
+        // reference → use-after-free → vtable corruption → crash.
+        //
+        // The GC hash table is at offset 0x67A10 from mono_data_start.
+        // It has 128 buckets (thread_id & 0x7F), each a linked list of entries.
+        // Entry layout (36 bytes):
+        //   +0x00: next pointer (linked list)
+        //   +0x04: thread_id (from pthread_self = SceUID)
+        //   +0x10: stack_bottom
+        //   +0x14: flags (0)
+        //   +0x18: stack_top (aligned)
+        if (mono_data_start != 0) {
+            constexpr uint32_t GC_HASH_TABLE_OFFSET = 0x67A10;
+            constexpr uint32_t GC_ENTRY_SIZE = 0x24; // 36 bytes
+            constexpr uint32_t GC_HASH_BUCKETS = 128;
+
+            Address hash_table_addr = mono_data_start + GC_HASH_TABLE_OFFSET;
+            Address entry_addr = alloc(mem, GC_ENTRY_SIZE, "GC_thread_entry");
+            if (entry_addr) {
+                uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
+                uint32_t hash = (thread_id_val & 0x7F);
+                Address bucket_addr = hash_table_addr + hash * 4;
+
+                // Read old head of bucket
+                uint32_t old_head = *Ptr<uint32_t>(bucket_addr).get(mem);
+
+                // Fill entry
+                uint32_t *entry = Ptr<uint32_t>(entry_addr).get(mem);
+                memset(entry, 0, GC_ENTRY_SIZE);
+                entry[0] = old_head;                          // next
+                entry[1] = thread_id_val;                     // thread_id
+                entry[4] = thread->stack_top() - stack_size;  // stack_bottom (entry+0x10)
+                entry[6] = thread->stack_top();               // stack_top (entry+0x18)
+
+                // Insert at head of bucket
+                *Ptr<uint32_t>(bucket_addr).get(mem) = entry_addr;
+
+                LOG_INFO("Mono GC: registered thread {} (ID:{}) in hash table bucket {}",
+                         name, thread->id, hash);
+            }
+        }
     }
 
     const auto lock = std::lock_guard(mutex);
