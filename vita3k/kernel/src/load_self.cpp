@@ -770,6 +770,10 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
         }
+        if (segment_reloc_info.count(1)) {
+            kernel.mono_data_start = segment_reloc_info[1].addr;
+            LOG_INFO("Mono module detected: data segment @ 0x{:08X}", kernel.mono_data_start);
+        }
     }
 
     const SceUID uid = kernel.get_next_uid();

@@ -24,6 +24,7 @@
 #include <kernel/thread/thread_state.h>
 
 #include <cpu/functions.h>
+#include <mem/functions.h>
 #include <mem/ptr.h>
 #include <util/lock_and_find.h>
 #include <util/log.h>
@@ -104,6 +105,56 @@ static int SDLCALL thread_function(void *data) {
     // without any Dynarmic cycle counting overhead.
     if (thread->name.find("Mono") != std::string::npos) {
         pin_thread_to_core(0);
+
+        // Register this thread in the Mono GC exception table.
+        // On real Vita, each thread calls GC_psp2_init → FUN_84dc90d0(threadId)
+        // which adds it to the table at DAT_848b6a10. But the call is guarded by
+        // a one-time flag (DAT_848588a8), so only the FIRST thread gets registered.
+        // Worker threads are never in the table, causing the Mono exception callback
+        // to crash when they fault (it searches the table, finds nothing, and does
+        // str r0,[NULL]).
+        //
+        // We write directly to guest memory to register each Mono thread,
+        // replicating what FUN_84dc90d0 does:
+        // 1. Allocate a 12-byte entry: [threadId, stackTop, 0]
+        // 2. Find an empty slot in the table (256 max)
+        // 3. Store the entry pointer there
+        // 4. Update the counter
+        if (params.kernel->mono_data_start != 0) {
+            Address table_addr = params.kernel->mono_data_start + KernelState::MONO_GC_TABLE_OFFSET;
+            Address counter_addr = params.kernel->mono_data_start + KernelState::MONO_GC_COUNTER_OFFSET;
+            MemState &mem = thread->mem;
+
+            // Allocate entry in guest memory: [threadId, stackTop, 0]
+            Address entry_addr = alloc(mem, 12, "MonoGCThreadEntry");
+            if (entry_addr) {
+                auto entry = Ptr<uint32_t>(entry_addr).get(mem);
+                entry[0] = static_cast<uint32_t>(thread->id);  // threadId
+                entry[1] = thread->stack.get() + thread->stack_size;  // stack top
+                entry[2] = 0;
+
+                // Find empty slot in table
+                auto table = Ptr<uint32_t>(table_addr).get(mem);
+                auto counter = Ptr<int32_t>(counter_addr).get(mem);
+                bool registered = false;
+
+                for (int i = 0; i < KernelState::MONO_GC_TABLE_MAX; i++) {
+                    if (table[i] == 0) {
+                        table[i] = entry_addr;
+                        if (i > *counter) {
+                            *counter = i;
+                        }
+                        LOG_INFO("Registered Mono thread {} (ID: {}) in GC exception table slot {}",
+                                 thread->name, thread->id, i);
+                        registered = true;
+                        break;
+                    }
+                }
+                if (!registered) {
+                    LOG_ERROR("GC exception table full — could not register thread {}", thread->id);
+                }
+            }
+        }
     }
 
     try {

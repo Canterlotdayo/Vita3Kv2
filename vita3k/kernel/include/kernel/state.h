@@ -35,6 +35,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -148,6 +149,19 @@ struct KernelState {
     // caused by concurrent JIT compilation on multiple threads).
     Address mono_code_start = 0;
     Address mono_code_end = 0;
+    Address mono_data_start = 0;    // segment 1 base of mono-vita.suprx
+
+    // Offsets within mono-vita data segment for the GC thread exception table.
+    // These are found via Ghidra analysis of mono-vita.suprx.
+    // The table is used by the Mono exception callback to find the GC handler
+    // block guard for a faulting thread. If a thread is not in this table,
+    // the callback crashes (writes to NULL pointer).
+    // On real Vita, every thread is registered via GC_psp2_init → FUN_84dc90d0.
+    // But the registration only happens for the FIRST thread (one-time guard).
+    // We fix this by writing directly to the table for each Mono thread.
+    static constexpr uint32_t MONO_GC_TABLE_OFFSET = 0x66A10;    // DAT_848b6a10 - data_base
+    static constexpr uint32_t MONO_GC_COUNTER_OFFSET = 0x4F34;   // DAT_84854f34 - data_base
+    static constexpr int MONO_GC_TABLE_MAX = 256;
 
     // Per-core scheduling: on the real Vita, threads with the same CPU affinity
     // share a core and are time-sliced (never truly parallel). Vita3K runs each
@@ -180,6 +194,7 @@ struct KernelState {
     int mono_exception_null_count = 0;         // consecutive failed exceptions (r0=0) for same thread
     int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
     bool mono_exception_skip_resume = false;   // when true, ResumeThreadForMono skips the resume
+    std::set<SceUID> mono_exception_dead_threads; // threads permanently suspended (exception failed)
 
     uint64_t start_tick;
     SceRtcTick base_tick;

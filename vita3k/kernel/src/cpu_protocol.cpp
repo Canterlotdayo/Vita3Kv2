@@ -74,6 +74,15 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
     if (kernel->mono_code_start == 0)
         return false;
 
+    // Don't signal for threads that have been permanently suspended
+    // (their exception callback failed and they were not resumed)
+    {
+        std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
+        if (kernel->mono_exception_dead_threads.count(thread_id)) {
+            return false;
+        }
+    }
+
     SceUID sema = 0;
     {
         std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
