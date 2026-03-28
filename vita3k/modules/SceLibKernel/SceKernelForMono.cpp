@@ -102,10 +102,28 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         }
     }
 
+    // Write exception info into the output structure.
+    // The structure layout (from Ghidra disassembly):
+    //   +0x00: size (set by caller to 0x18 = 24 bytes)
+    //   +0x04: faulting thread ID (SceUID — the callback converts to pthread_t
+    //          via pthread_getspecific_for_thread before searching the table)
+    //   +0x08: fault address
+    //   +0x0C: fault PC
+    //   +0x10: exception type
+    //   +0x14: reserved
+    if (pInfo) {
+        uint32_t *info = pInfo.get(emuenv.mem);
+        info[1] = static_cast<uint32_t>(faulting_tid);  // SceUID
+        info[2] = fault_addr;
+        info[3] = fault_pc;
+        info[4] = 0x101;
+        info[5] = 0;
+    }
+
     // Get the faulting thread's pthread_t from its name (hex prefix like "8BF2E610 Mono").
-    // On real Vita, the kernel passes the pthread_t in the exception info.
-    // The Mono callback searches the exception table by this ID.
-    uint32_t pthread_id = static_cast<uint32_t>(faulting_tid); // fallback to SceUID
+    // Exception table entries use pthread_t (the callback converts SceUID→pthread_t
+    // via NID 0x23D5CB94 before searching).
+    uint32_t pthread_id = static_cast<uint32_t>(faulting_tid); // fallback
     if (faulting_thread) {
         const std::string &tname = faulting_thread->name;
         if (!tname.empty()) {
@@ -115,24 +133,6 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
                 pthread_id = static_cast<uint32_t>(parsed);
             }
         }
-    }
-
-    // Write exception info into the output structure.
-    // The structure layout (from Ghidra disassembly):
-    //   +0x00: size (set by caller to 0x18 = 24 bytes)
-    //   +0x04: faulting thread ID (pthread_t, NOT SceUID)
-    //   +0x08: fault address
-    //   +0x0C: fault PC
-    //   +0x10: exception type
-    //   +0x14: reserved
-    if (pInfo) {
-        uint32_t *info = pInfo.get(emuenv.mem);
-        // info[0] = size, already set by caller (0x18)
-        info[1] = pthread_id;  // pthread_t so callback can find it in exception table
-        info[2] = fault_addr;
-        info[3] = fault_pc;
-        info[4] = 0x101;  // exception type (same as the type parameter)
-        info[5] = 0;
     }
 
     // Ensure the faulting thread is in the Mono exception table so the
