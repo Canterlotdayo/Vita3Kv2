@@ -135,12 +135,33 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         }
     }
 
-    // Ensure the faulting thread is in the Mono exception table so the
-    // callback (FUN_84DC94FC) can find it by pthread_t. Without this,
-    // the callback returns r0=0 → thread killed → game freezes.
-    if (emuenv.kernel.mono_data_start != 0 && faulting_thread) {
+    // Dump exception table to understand the entry format used by Mono's own registration.
+    if (emuenv.kernel.mono_data_start != 0) {
         constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
         constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
+
+        Address table_addr = emuenv.kernel.mono_data_start + EXCEPTION_TABLE_OFFSET;
+        Address counter_addr = emuenv.kernel.mono_data_start + EXCEPTION_COUNTER_OFFSET;
+        uint32_t *counter = Ptr<uint32_t>(counter_addr).get(emuenv.mem);
+        uint32_t count = *counter;
+
+        LOG_WARN("Exception table dump: count={}, faulting_tid={}", count, faulting_tid);
+        if (count < 256) {
+            uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
+            for (uint32_t i = 0; i < count && i < 5; i++) {
+                if (table[i]) {
+                    uint32_t *entry = Ptr<uint32_t>(table[i]).get(emuenv.mem);
+                    if (entry) {
+                        LOG_WARN("  table[{}] = 0x{:08X} → [0]={:08X} [1]={:08X} [2]={:08X} [3]={:08X}",
+                                 i, table[i], entry[0], entry[1], entry[2], entry[3]);
+                    }
+                } else {
+                    LOG_WARN("  table[{}] = NULL", i);
+                }
+            }
+            if (count > 5) LOG_WARN("  ... ({} more entries)", count - 5);
+        }
+    }
 
         Address table_addr = emuenv.kernel.mono_data_start + EXCEPTION_TABLE_OFFSET;
         Address counter_addr = emuenv.kernel.mono_data_start + EXCEPTION_COUNTER_OFFSET;
