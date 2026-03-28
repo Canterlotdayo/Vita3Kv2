@@ -53,9 +53,34 @@ void CPUProtocol::call_svc(CPUState &cpu, uint32_t svc, Address pc, ThreadState 
 
     // This is usual service call
     uint32_t nid = *Ptr<uint32_t>(pc + 4).get(*mem);
+
+    // Debug: trace the pthread function that converts SceUID to exception table key.
+    // NID 0x23D5CB94 is called by the Mono exception callback to look up the
+    // faulting thread. Logging its input/output reveals what the search key is.
+    bool trace_nid = (nid == 0x23D5CB94);
+    uint32_t trace_r0_in = 0, trace_r1_in = 0;
+    if (trace_nid) {
+        trace_r0_in = read_reg(cpu, 0);
+        trace_r1_in = read_reg(cpu, 1);
+    }
+
     // TODO: just supply ThreadStatePtr to call_import
     // the only benefit of using thread_id instead--namely less locking-- has been gone for long
     call_import(cpu, nid, thread.id);
+
+    if (trace_nid) {
+        uint32_t trace_r0_out = read_reg(cpu, 0);
+        // Read the output value written to [r1_in]
+        uint32_t output_val = 0;
+        if (trace_r1_in) {
+            Ptr<uint32_t> out_ptr(trace_r1_in);
+            if (out_ptr.valid(*mem)) {
+                output_val = *out_ptr.get(*mem);
+            }
+        }
+        LOG_WARN("NID 0x23D5CB94: r0_in=0x{:X} r1_in=0x{:X} → r0_out=0x{:X} output_val=0x{:X}",
+                 trace_r0_in, trace_r1_in, trace_r0_out, output_val);
+    }
 
     // ARM recommends clearing exclusive state inside interrupt handler
     clear_exclusive(kernel->exclusive_monitor, get_processor_id(cpu));
