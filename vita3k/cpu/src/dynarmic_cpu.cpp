@@ -28,6 +28,8 @@
 #include <dynarmic/interface/exclusive_monitor.h>
 
 #include <memory>
+#include <chrono>
+#include <thread>
 #include <optional>
 #include <string>
 
@@ -129,6 +131,29 @@ public:
                 mono_exception_signaled = true;
                 cpu->jit->HaltExecution();
                 return 0xE320F000;
+            }
+
+            // If Mono is loaded but signal was BLOCKED (another exception pending),
+            // DON'T fall through to the NOP fallback — that corrupts the thread.
+            // On real Vita, each thread's exception is handled independently.
+            // We must wait for the pending exception to be processed, then retry.
+            if (parent->protocol && parent->protocol->kernel->mono_code_start != 0) {
+                // Spin-wait until we can signal. The ExceptionHandlerThread is
+                // processing another exception; once it calls ResumeThreadForMono
+                // and goes back to WaitExceptionForMono, pending becomes false.
+                int wait_count = 0;
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return 0xE320F000;
+                    }
+                    if (++wait_count > 100000) { // 10 second timeout
+                        LOG_ERROR("Mono exception signal timeout for thread {} — falling through", parent->thread_id);
+                        break;
+                    }
+                }
             }
 
             // Fallback for non-Mono games or when handler isn't ready:
