@@ -265,34 +265,13 @@ bool ThreadState::run_loop() {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
                 } else {
-                    // Serialize Mono thread execution: only one Mono thread
-                    // can execute JIT code at a time. This prevents race
-                    // conditions in mono_class_init (vtable setup) that cause
-                    // threads to jump to uninitialized JIT code addresses.
-                    //
-                    // On the real Vita, Mono threads share a single CPU core
-                    // and are time-sliced — they never run in true parallel.
-                    // The OS affinity hint on macOS doesn't guarantee this,
-                    // so we enforce it with a mutex.
-                    bool is_mono = cpu->use_mono_scheduling;
-                    if (is_mono) {
-                        kernel.mono_thread_mutex.lock();
-                    }
-
                     cpu->pre_run_context = save_context(*cpu);
                     res = run(*cpu);
-
-                    if (is_mono) {
-                        kernel.mono_thread_mutex.unlock();
-                    }
                 }
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
-                    if (cpu->use_mono_scheduling) {
-                        cpu->pre_run_context = save_context(*cpu);
-                    }
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
 

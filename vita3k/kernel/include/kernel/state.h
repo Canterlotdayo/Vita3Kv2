@@ -179,6 +179,7 @@ struct KernelState {
     CPUContext mono_exception_saved_context;    // full CPU context at time of fault
     int mono_exception_null_count = 0;         // consecutive failed exceptions (r0=0) for same thread
     int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
+    bool mono_exception_skip_resume = false;   // when true, ResumeThreadForMono skips the resume
 
     uint64_t start_tick;
     SceRtcTick base_tick;

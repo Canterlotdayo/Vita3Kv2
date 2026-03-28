@@ -723,22 +723,20 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         // and PC to a trampoline epilogue. That epilogue expects a stack frame
         // that doesn't exist, so it would crash and cascade into re-faults.
         //
-        // Fix: halt the thread. On the real Vita, this scenario causes an abort
-        // (sceKernelCallAbortHandler) which blocks the thread forever. The game
-        // continues with one less worker thread. We do the same by jumping to
-        // the halt instruction, which makes the thread exit cleanly.
+        // Fix: don't resume the thread. Set a flag so ResumeThreadForMono
+        // skips the resume. The thread stays suspended forever, same as what
+        // sceKernelCallAbortHandler does on the real Vita. The game continues
+        // with one less worker thread.
         if (infoCpu->reg[0] == 0 && emuenv.kernel.mono_exception_thread_id == threadId) {
             emuenv.kernel.mono_exception_null_count++;
-
-            const ThreadStatePtr t = emuenv.kernel.get_thread(threadId);
-            if (t) {
-                LOG_WARN("  SetCtx: Mono exception NULL (count={}) — halting thread {} (same as abort)",
+            if (emuenv.kernel.mono_exception_null_count <= 3) {
+                LOG_WARN("  SetCtx: Mono exception NULL (count={}) — will NOT resume thread {}",
                          emuenv.kernel.mono_exception_null_count, threadId);
-                infoCpu->reg[0] = 0;
-                infoCpu->reg[15] = t->cpu->halt_instruction_pc;
             }
+            emuenv.kernel.mono_exception_skip_resume = true;
         } else if (infoCpu->reg[0] != 0) {
             emuenv.kernel.mono_exception_null_count = 0;
+            emuenv.kernel.mono_exception_skip_resume = false;
         }
 
         // Check if r0 points to valid memory (trampoline needs this as context ptr)
