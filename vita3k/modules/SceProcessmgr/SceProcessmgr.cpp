@@ -108,9 +108,16 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
     LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
              tname, thread_id, param1, param2);
 
-    // Terminate the thread to prevent abort()'s chain from reaching
-    // sceKernelExitProcess. With per-core time-sliced scheduling,
-    // the Mono race condition should not occur in the first place.
+    // For Mono threads, the abort is typically caused by a benign race condition
+    // in mono_class_init ("pending init"). On the real Vita this doesn't happen
+    // because threads on the same core are time-sliced. Killing the thread would
+    // corrupt Mono's runtime state and freeze the game. Instead, just return —
+    // the Mono runtime will handle the situation internally.
+    if (thread && thread->name.find("Mono") != std::string::npos) {
+        LOG_WARN("Abort on Mono thread {} — NOT killing, returning to let Mono continue", thread_id);
+        return 0;
+    }
+
     if (thread) {
         thread->exit_delete(false);
     }
