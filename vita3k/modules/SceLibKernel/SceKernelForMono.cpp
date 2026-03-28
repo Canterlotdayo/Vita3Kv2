@@ -22,6 +22,7 @@
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
 #include <kernel/thread/thread_state.h>
+#include <mem/functions.h>
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceKernelForMono);
 
@@ -117,6 +118,64 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         info[3] = fault_pc;
         info[4] = 0x101;  // exception type (same as the type parameter)
         info[5] = 0;
+    }
+
+    // Ensure the faulting thread is in the Mono exception table so the
+    // callback (FUN_84DC94FC) can find it by pthread_t. Without this,
+    // the callback returns r0=0 → thread killed → game freezes.
+    // We register HERE (not at create_thread) because:
+    // - Mono's counter is initialized by now
+    // - The thread has a valid pthread_t
+    // - We can check for duplicates
+    if (emuenv.kernel.mono_data_start != 0 && faulting_thread) {
+        constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
+        constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
+
+        // Get the faulting thread's pthread_t from its name (hex prefix)
+        uint32_t pthread_id = static_cast<uint32_t>(faulting_tid);
+        const std::string &tname = faulting_thread->name;
+        if (!tname.empty()) {
+            char *end = nullptr;
+            unsigned long parsed = strtoul(tname.c_str(), &end, 16);
+            if (end != tname.c_str() && *end == ' ' && parsed > 0x80000000) {
+                pthread_id = static_cast<uint32_t>(parsed);
+            }
+        }
+
+        Address table_addr = emuenv.kernel.mono_data_start + EXCEPTION_TABLE_OFFSET;
+        Address counter_addr = emuenv.kernel.mono_data_start + EXCEPTION_COUNTER_OFFSET;
+        uint32_t *counter = Ptr<uint32_t>(counter_addr).get(emuenv.mem);
+        uint32_t count = *counter;
+
+        // Check if already registered
+        bool found = false;
+        if (count < 256) {
+            uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
+            for (uint32_t i = 0; i < count && !found; i++) {
+                if (table[i]) {
+                    uint32_t *entry = Ptr<uint32_t>(table[i]).get(emuenv.mem);
+                    if (entry && entry[0] == pthread_id) {
+                        found = true;
+                    }
+                }
+            }
+        }
+
+        if (!found && count < 256) {
+            Address exc_entry = alloc(emuenv.mem, 8, "GC_exc_entry");
+            if (exc_entry) {
+                uint32_t *exc = Ptr<uint32_t>(exc_entry).get(emuenv.mem);
+                exc[0] = pthread_id;
+                exc[1] = 0;
+
+                uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
+                table[count] = exc_entry;
+                *counter = count + 1;
+
+                LOG_WARN("Mono exception table: registered faulting thread '{}' (pthread_t=0x{:08X}) at idx={}",
+                         tname, pthread_id, count);
+            }
+        }
     }
 
     LOG_WARN("sceKernelWaitExceptionForMono: woke up! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",

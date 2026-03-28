@@ -185,10 +185,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
         return nullptr;
 
-    // Detect Mono worker threads by name. Only threads with "Mono" in
-    // their name are actual Mono managed workers that need GC registration.
-    // System threads (SceFios, FMOD, avAudio, Unity*) must NOT be registered
-    // even if their entry points are in the eboot range.
+    // Detect Mono worker threads by name for scheduling purposes.
     bool is_mono_worker = (name && std::string(name).find("Mono") != std::string::npos);
     bool is_exception_handler = (name && std::string(name).find("ExceptionHandler") != std::string::npos);
 
@@ -196,53 +193,11 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
         thread->cpu->use_mono_scheduling = true;
     }
 
-    // Register actual Mono workers in the exception table only.
-    // The GC hash table is managed by Mono's own GC_register_my_thread —
-    // we must NOT write to it (duplicates cause infinite loops during GC).
-    // We only need the exception table so the Mono exception callback
-    // finds the thread and returns r0≠0 (enabling NullReferenceException dispatch).
-    if (is_mono_worker && !is_exception_handler && mono_data_start != 0) {
-        constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
-        constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
-
-        Address ep = entry_point.address();
-
-        // The Mono exception callback searches by pthread_self return value,
-        // which is the pthread_t handle (pointer to pthread struct).
-        // The game names threads "8BC449B0 Mono" where the hex prefix IS
-        // the pthread_t. Extract it; fall back to SceUID if parsing fails.
-        uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
-        if (name) {
-            char *end = nullptr;
-            unsigned long parsed = strtoul(name, &end, 16);
-            if (end != name && *end == ' ' && parsed > 0x80000000) {
-                thread_id_val = static_cast<uint32_t>(parsed);
-            }
-        }
-
-        // --- Exception Table Registration ---
-        Address counter_addr = mono_data_start + EXCEPTION_COUNTER_OFFSET;
-        Address table_addr = mono_data_start + EXCEPTION_TABLE_OFFSET;
-        uint32_t *counter = Ptr<uint32_t>(counter_addr).get(mem);
-        uint32_t idx = *counter;
-        if (idx < 256) {
-            Address exc_entry = alloc(mem, 8, "GC_exc_entry");
-            if (exc_entry) {
-                uint32_t *exc = Ptr<uint32_t>(exc_entry).get(mem);
-                exc[0] = thread_id_val;
-                exc[1] = 0;
-
-                uint32_t *table = Ptr<uint32_t>(table_addr).get(mem);
-                table[idx] = exc_entry;
-                *counter = idx + 1;
-            }
-            LOG_INFO("Mono GC: registered '{}' (ID:{}, pthread_t=0x{:08X}) in exception table (idx={})",
-                     name, thread->id, thread_id_val, idx);
-        } else {
-            LOG_WARN("Mono GC: skipping exception table for '{}' (ID:{}) — counter={} (not initialized yet)",
-                     name, thread->id, idx);
-        }
-    }
+    // NOTE: Mono exception table registration is done in WaitExceptionForMono
+    // (SceKernelForMono.cpp) at the right time — when a thread faults and
+    // the callback needs to find it. Registering here (at create_thread time)
+    // is too early: Mono's counter isn't initialized yet, and we'd create
+    // duplicates with Mono's own registration.
 
     const auto lock = std::lock_guard(mutex);
     threads.emplace(thread->id, thread);
