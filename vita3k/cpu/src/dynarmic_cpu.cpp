@@ -160,6 +160,7 @@ public:
     // Prevents the fallback path from redirecting PC on subsequent
     // MemoryReadCode callbacks in the same basic block.
     bool mono_exception_signaled = false;
+    int mono_suspend_read_count = 0;
 
     static void TraceInstruction(uint64_t self_, uint64_t address, uint64_t is_thumb) {
         ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
@@ -183,11 +184,25 @@ public:
     T MemoryRead(Dynarmic::A32::VAddr addr) {
         Ptr<T> ptr{ addr };
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
-            // If a Mono exception was already signaled, return 0 without
-            // triggering the escape mechanism. The thread is being suspended;
-            // the exception handler will fix the PC via SetThreadContextForMono.
+            // If a Mono exception was already signaled, count invalid reads.
+            // After the first exception is handled and the thread resumes,
+            // it may re-fault. The flag stays true from the JIT block finishing.
+            // After enough invalid reads, reset and try to signal again.
             if (mono_exception_signaled) {
-                LOG_TRACE("MemoryRead during Mono exception suspend (addr=0x{:x}) - ignoring", addr);
+                mono_suspend_read_count++;
+                if (mono_suspend_read_count > 64) {
+                    // Thread was resumed but re-faulted. Reset and re-signal.
+                    auto pc = this->cpu->get_pc();
+                    mono_exception_signaled = false;
+                    mono_suspend_read_count = 0;
+                    if (parent->protocol &&
+                        parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                        LOG_WARN("Re-signaling Mono exception for thread (PC=0x{:X}, addr=0x{:X})", pc, addr);
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return 0;
+                    }
+                }
                 return 0;
             }
 
@@ -490,6 +505,7 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     cb->mono_exception_signaled = false;
+    cb->mono_suspend_read_count = 0;
     Dynarmic::HaltReason halt_reason;
     do {
         halt_reason = jit->Run();
