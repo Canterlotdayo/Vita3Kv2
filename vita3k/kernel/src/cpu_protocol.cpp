@@ -122,12 +122,59 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
         {
             std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
             kernel->mono_exception_saved_context = save_context(*faulting_thread->cpu);
-            // Override PC with the actual fault PC (regs[15] only updated at block exit)
             kernel->mono_exception_saved_context.cpu_registers[15] = fault_pc;
+
+            auto &ctx = kernel->mono_exception_saved_context;
             LOG_WARN("signal_mono_exception: saved LIVE context r0=0x{:08X} SP=0x{:08X} LR=0x{:08X}",
-                     kernel->mono_exception_saved_context.cpu_registers[0],
-                     kernel->mono_exception_saved_context.cpu_registers[13],
-                     kernel->mono_exception_saved_context.cpu_registers[14]);
+                     ctx.cpu_registers[0], ctx.cpu_registers[13], ctx.cpu_registers[14]);
+
+            // Dump all registers for debugging vtable null entry
+            LOG_WARN("  regs: r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} r5={:08X}",
+                     ctx.cpu_registers[0], ctx.cpu_registers[1], ctx.cpu_registers[2],
+                     ctx.cpu_registers[3], ctx.cpu_registers[4], ctx.cpu_registers[5]);
+            LOG_WARN("  regs: r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X} r11(fp)={:08X} r12={:08X}",
+                     ctx.cpu_registers[6], ctx.cpu_registers[7], ctx.cpu_registers[8],
+                     ctx.cpu_registers[9], ctx.cpu_registers[10], ctx.cpu_registers[11], ctx.cpu_registers[12]);
+
+            // If fp (r11) is valid, dump the stack frame (the object and args)
+            MemState &mstate = *this->mem;
+            Address fp_addr = ctx.cpu_registers[11];
+            if (fp_addr > 0x1000 && fp_addr < 0xF0000000) {
+                Ptr<uint32_t> fp_ptr(fp_addr);
+                if (fp_ptr.valid(mstate)) {
+                    uint32_t *fp_data = fp_ptr.get(mstate);
+                    LOG_WARN("  [fp+0]={:08X} [fp+4]={:08X} [fp+8]={:08X} [fp+C]={:08X}",
+                             fp_data[0], fp_data[1], fp_data[2], fp_data[3]);
+
+                    // fp+4 is the object pointer in the faulting code at 0x8236FE*
+                    uint32_t obj_addr = fp_data[1];
+                    if (obj_addr > 0x1000 && obj_addr < 0xF0000000) {
+                        Ptr<uint32_t> obj_ptr(obj_addr);
+                        if (obj_ptr.valid(mstate)) {
+                            uint32_t *obj_data = obj_ptr.get(mstate);
+                            LOG_WARN("  object@{:08X}: [{:08X} {:08X} {:08X} {:08X}]",
+                                     obj_addr, obj_data[0], obj_data[1], obj_data[2], obj_data[3]);
+
+                            // obj_data[0] is the vtable pointer
+                            uint32_t vtable_addr = obj_data[0];
+                            if (vtable_addr > 0x1000 && vtable_addr < 0xF0000000) {
+                                Ptr<uint32_t> vt_ptr(vtable_addr);
+                                if (vt_ptr.valid(mstate)) {
+                                    uint32_t *vt = vt_ptr.get(mstate);
+                                    LOG_WARN("  vtable@{:08X}: [0]={:08X} [4]={:08X} [8]={:08X} [C]={:08X}",
+                                             vtable_addr, vt[0], vt[1], vt[2], vt[3]);
+                                    LOG_WARN("  vtable: [10]={:08X} [14]={:08X} [18]={:08X} [1C]={:08X}",
+                                             vt[4], vt[5], vt[6], vt[7]);
+                                    LOG_WARN("  vtable: [20]={:08X} [24]={:08X} [28]={:08X} [2C]={:08X}",
+                                             vt[8], vt[9], vt[10], vt[11]);
+                                    LOG_WARN("  vtable: [30]={:08X} [34]={:08X} [38]={:08X} [3C]={:08X}",
+                                             vt[12], vt[13], vt[14], vt[15]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         faulting_thread->suspend();
     }
