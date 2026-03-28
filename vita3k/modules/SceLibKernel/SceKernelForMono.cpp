@@ -102,10 +102,25 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         }
     }
 
+    // Get the faulting thread's pthread_t from its name (hex prefix like "8BF2E610 Mono").
+    // On real Vita, the kernel passes the pthread_t in the exception info.
+    // The Mono callback searches the exception table by this ID.
+    uint32_t pthread_id = static_cast<uint32_t>(faulting_tid); // fallback to SceUID
+    if (faulting_thread) {
+        const std::string &tname = faulting_thread->name;
+        if (!tname.empty()) {
+            char *end = nullptr;
+            unsigned long parsed = strtoul(tname.c_str(), &end, 16);
+            if (end != tname.c_str() && *end == ' ' && parsed > 0x80000000) {
+                pthread_id = static_cast<uint32_t>(parsed);
+            }
+        }
+    }
+
     // Write exception info into the output structure.
     // The structure layout (from Ghidra disassembly):
     //   +0x00: size (set by caller to 0x18 = 24 bytes)
-    //   +0x04: faulting thread ID
+    //   +0x04: faulting thread ID (pthread_t, NOT SceUID)
     //   +0x08: fault address
     //   +0x0C: fault PC
     //   +0x10: exception type
@@ -113,7 +128,7 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     if (pInfo) {
         uint32_t *info = pInfo.get(emuenv.mem);
         // info[0] = size, already set by caller (0x18)
-        info[1] = static_cast<uint32_t>(faulting_tid);
+        info[1] = pthread_id;  // pthread_t so callback can find it in exception table
         info[2] = fault_addr;
         info[3] = fault_pc;
         info[4] = 0x101;  // exception type (same as the type parameter)
@@ -123,24 +138,9 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     // Ensure the faulting thread is in the Mono exception table so the
     // callback (FUN_84DC94FC) can find it by pthread_t. Without this,
     // the callback returns r0=0 → thread killed → game freezes.
-    // We register HERE (not at create_thread) because:
-    // - Mono's counter is initialized by now
-    // - The thread has a valid pthread_t
-    // - We can check for duplicates
     if (emuenv.kernel.mono_data_start != 0 && faulting_thread) {
         constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
         constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
-
-        // Get the faulting thread's pthread_t from its name (hex prefix)
-        uint32_t pthread_id = static_cast<uint32_t>(faulting_tid);
-        const std::string &tname = faulting_thread->name;
-        if (!tname.empty()) {
-            char *end = nullptr;
-            unsigned long parsed = strtoul(tname.c_str(), &end, 16);
-            if (end != tname.c_str() && *end == ' ' && parsed > 0x80000000) {
-                pthread_id = static_cast<uint32_t>(parsed);
-            }
-        }
 
         Address table_addr = emuenv.kernel.mono_data_start + EXCEPTION_TABLE_OFFSET;
         Address counter_addr = emuenv.kernel.mono_data_start + EXCEPTION_COUNTER_OFFSET;
