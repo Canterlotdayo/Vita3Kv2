@@ -73,7 +73,12 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
 
-    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get());
+    // Determine if this thread needs scheduling (cycle counting + mutex).
+    // Must be set BEFORE init_cpu because make_jit reads use_mono_scheduling
+    // to decide whether to enable cycle counting in the JIT.
+    const bool needs_scheduling = (std::string(name).find("Mono") != std::string::npos);
+
+    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get(), needs_scheduling);
     if (!cpu) {
         return SCE_KERNEL_ERROR_ERROR;
     }
@@ -276,7 +281,6 @@ bool ThreadState::run_loop() {
             // is handled by the abort handler (returns 0, thread survives).
             {
             const bool is_mono_thread = (name.find("Mono") != std::string::npos);
-            cpu->use_mono_scheduling = is_mono_thread;
 
             // Run the cpu
             do {
