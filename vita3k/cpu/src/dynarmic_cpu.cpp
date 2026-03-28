@@ -220,10 +220,8 @@ public:
             auto pc = this->cpu->get_pc();
 
             // Null pointer data read (addr in first page) — signal Mono exception.
-            // On the real Vita, a data abort on a null address triggers the same
-            // exception handler as a prefetch abort. The PC of the faulting
-            // instruction is saved so the Mono callback can redirect execution.
-            if (addr < parent->mem->page_size && parent->protocol) {
+            // But don't re-signal if already signaled in this run().
+            if (addr < parent->mem->page_size && parent->protocol && !mono_exception_signaled) {
                 auto lr = cpu->get_lr();
                 if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
                     mono_exception_signaled = true;
@@ -233,8 +231,8 @@ public:
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
-            // This is typically a null function pointer call (C# NullReferenceException).
-            // Try to signal the Mono exception handler to redirect execution.
+            // But don't re-signal if a Mono exception was already signaled
+            // in this run() — the first signal has the correct fault data.
             {
                 Ptr<uint32_t> pc_check{ static_cast<uint32_t>(pc) };
                 if (pc && !pc_check.valid(*parent->mem)) {
