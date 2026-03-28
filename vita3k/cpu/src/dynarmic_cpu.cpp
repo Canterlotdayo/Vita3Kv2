@@ -193,9 +193,20 @@ public:
 
             auto pc = this->cpu->get_pc();
 
-            // If the PC itself is in invalid/unmapped memory (e.g., module was unloaded
-            // while this thread was still executing code in it), halt immediately.
-            // The entire code region is gone — no point trying to escape.
+            // Null pointer data read (addr in first page) — signal Mono exception.
+            // On the real Vita, a data abort on a null address triggers the same
+            // exception handler as a prefetch abort. The PC of the faulting
+            // instruction is saved so the Mono callback can redirect execution.
+            if (addr < parent->mem->page_size && parent->protocol) {
+                auto lr = cpu->get_lr();
+                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                    mono_exception_signaled = true;
+                    cpu->jit->HaltExecution();
+                    return 0;
+                }
+            }
+
+            // If the PC itself is in invalid/unmapped memory, halt immediately.
             {
                 Ptr<uint32_t> pc_check{ static_cast<uint32_t>(pc) };
                 if (pc && !pc_check.valid(*parent->mem)) {
@@ -207,8 +218,10 @@ public:
 
             // Detect infinite loop: if the same PC keeps reading invalid addresses,
             // the thread is stuck in a loop reading from a null object (e.g., iterating
-            // a null IEnumerator's vtable). After enough attempts, escape the loop by
-            // forcing a return to the caller.
+            // a null IEnumerator's vtable). After enough attempts, try to signal the
+            // Mono exception handler (which can redirect to a C# catch handler).
+            // If Mono isn't loaded or the handler isn't ready, fall back to the
+            // stack escape mechanism.
             if (pc == last_invalid_read_pc) {
                 invalid_read_count++;
             } else {
@@ -225,8 +238,19 @@ public:
             }
 
             if (invalid_read_count > 8) {
-                // Stuck in a loop. Try to escape by scanning the stack for a return
-                // address and forcing a return from the current function.
+                // Try to signal Mono exception handler first — it can properly
+                // redirect execution to a C# catch block.
+                if (parent->protocol &&
+                    parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                    LOG_WARN("Invalid read loop at PC=0x{:X} — signaled Mono exception handler", pc);
+                    mono_exception_signaled = true;
+                    cpu->jit->HaltExecution();
+                    invalid_read_count = 0;
+                    last_invalid_read_pc = 0;
+                    return 0;
+                }
+
+                // Fallback: scan the stack for a return address and force a return.
                 auto sp = cpu->jit->Regs()[13];
                 for (int i = 0; i < 32; i++) {
                     uint32_t stack_val_addr = sp + i * 4;
@@ -423,7 +447,7 @@ public:
         return 1ull << 60;
     }
 
-    static constexpr int64_t SCHED_QUANTUM = 333000; // ~1ms at 333MHz
+    static constexpr int64_t SCHED_QUANTUM = 3000000; // ~10ms at 333MHz
     int64_t ticks_remaining = SCHED_QUANTUM;
 
     void reset_ticks() {
