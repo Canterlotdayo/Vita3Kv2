@@ -785,6 +785,18 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             if (code) {
                 LOG_INFO("Mono stub scan: code_start=0x{:08X} code_size=0x{:X} first_word=0x{:08X}",
                          code_start, code_size, code[0]);
+
+                // Debug: check what's at the expected stub area (~offset 0x199000 from base)
+                // This is where stubs live in the known ELF. Log a few words to see if
+                // relocations changed them.
+                size_t stub_area_offset = 0x199000 / 4; // word index
+                if (stub_area_offset + 20 < code_size / 4) {
+                    LOG_INFO("Mono stub debug: words at offset 0x199000 (expected stub area):");
+                    for (int j = 0; j < 16; j++) {
+                        LOG_INFO("  [+0x{:X}] = 0x{:08X}", (stub_area_offset + j) * 4, code[stub_area_offset + j]);
+                    }
+                }
+
                 for (size_t i = 0; i < code_size / 4 - 1; i++) {
                     // Pattern: mvn r0, #0 (0xE3E00000) followed by bx lr (0xE12FFF1E)
                     if (code[i] == 0xE3E00000 && code[i + 1] == 0xE12FFF1E) {
