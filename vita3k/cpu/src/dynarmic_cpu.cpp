@@ -250,6 +250,20 @@ public:
                     cpu->jit->HaltExecution();
                     return 0;
                 }
+                // Signal BLOCKED — wait and retry (same as MemoryReadCode fix)
+                int wait_count = 0;
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return 0;
+                    }
+                    if (++wait_count > 100000) {
+                        LOG_ERROR("Mono data exception signal timeout for thread {}", parent->thread_id);
+                        break;
+                    }
+                }
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
