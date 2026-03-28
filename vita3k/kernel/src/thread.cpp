@@ -265,11 +265,26 @@ bool ThreadState::run_loop() {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
                 } else {
+                    // Serialize Mono thread execution: on real Vita, threads sharing
+                    // a CPU core are time-sliced and never truly parallel. Mono assumes
+                    // this for mono_class_init — the initializing thread holds a lock,
+                    // but other threads on the same core can't preempt it mid-init.
+                    // In Vita3K, true parallelism causes workers to read half-initialized
+                    // vtables. Fix: only one Mono thread executes guest code at a time.
+                    // The mutex is released during SVC handling (between run() calls)
+                    // so blocking SVCs allow other Mono threads to proceed.
+                    if (cpu->use_mono_scheduling)
+                        kernel.mono_thread_mutex.lock();
+
                     cpu->pre_run_context = save_context(*cpu);
                     res = run(*cpu);
+
+                    if (cpu->use_mono_scheduling)
+                        kernel.mono_thread_mutex.unlock();
                 }
 
                 // handle svc call if this was what stopped the cpu
+                // (runs WITHOUT the mono mutex — blocking SVCs won't deadlock)
                 if (cpu->svc_called) {
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                 }

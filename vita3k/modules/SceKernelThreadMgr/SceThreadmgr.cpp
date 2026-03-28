@@ -689,33 +689,33 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
                  threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
 
         // When the Mono exception callback can't find the faulting thread in the
-        // GC critical section table (thread not registered → FUN_84dc95bc returns NULL),
-        // it sets r0=0 and PC to the trampoline. The trampoline would crash because
-        // it needs r0 as a valid context pointer.
+        // GC critical section table (FUN_84dc95bc returns NULL → r0=0), the thread
+        // cannot be recovered. On real Vita, the callback crashes on str r0,[NULL],
+        // the kernel catches this double-fault, kills the ExceptionHandlerThread,
+        // and the faulting thread stays suspended forever. The game handles missing
+        // workers via timeouts.
         //
-        // Fix: instead of applying the callback's broken context (r0=0, PC=trampoline),
-        // restore the ORIGINAL context from before the fault with r0=0 and PC=LR.
-        // This returns execution to the C# caller of the faulting method.
-        // The C# JIT code always has null checks (cmp r0, #0; bne) that will
-        // handle r0=0 gracefully, taking the "null object" fallback path.
-        // The thread stays alive and continues working.
+        // In Vita3K: don't apply the callback's broken context to the faulting thread.
+        // Don't resume it. Add it to dead_threads so it's never re-signaled.
+        // The ExceptionHandlerThread continues normally to its wait loop.
         bool is_mono_exception_context = (emuenv.kernel.mono_exception_handler_thread != 0 &&
                                           new_pc >= emuenv.kernel.mono_code_start &&
                                           new_pc < emuenv.kernel.mono_code_end);
 
         if (infoCpu->reg[0] == 0 && is_mono_exception_context) {
-            // Restore the saved context from before the fault
-            CPUContext &saved = emuenv.kernel.mono_exception_saved_context;
-            Address original_lr = saved.cpu_registers[14];
+            LOG_WARN("  SetCtx: Mono exception r0=0 for thread {} — leaving thread suspended (like real Vita double-fault)",
+                     threadId);
 
-            LOG_WARN("  SetCtx: Mono exception r0=0 for thread {} — restoring original context "
-                     "with r0=0, PC=LR(0x{:08X})", threadId, original_lr);
+            // Don't apply the callback's context — leave faulting thread as-is (suspended)
+            // Set skip_resume so ResumeThreadForMono won't resume it
+            emuenv.kernel.mono_exception_skip_resume = true;
 
-            // Overwrite the callback's broken context with the pre-fault state
-            memcpy(infoCpu->reg, saved.cpu_registers.data(), 16 * 4);
-            infoCpu->reg[0] = 0;            // r0 = null (C# null check will catch this)
-            infoCpu->reg[15] = original_lr;  // PC = return to caller
-            infoCpu->cpsr = saved.cpsr;
+            // Add to dead_threads so signal_mono_exception ignores future faults
+            {
+                std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+                emuenv.kernel.mono_exception_dead_threads.insert(threadId);
+            }
+            return SCE_KERNEL_OK; // Return WITHOUT applying context
         }
 
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
