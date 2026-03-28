@@ -389,6 +389,33 @@ public:
                 LOG_CRITICAL("PC is 0x{:x}", pc);
             else
                 LOG_ERROR("Executing: {}", disassemble(*parent, pc, nullptr));
+
+            // On real Vita, an invalid write triggers a DATA ABORT → the kernel
+            // signals the exception handler → thread is suspended/killed.
+            // Without this, the thread continues with corrupted state and
+            // writes garbage to shared heap, causing cascading crashes.
+            if (parent->protocol && !mono_exception_signaled) {
+                auto lr = cpu->get_lr();
+                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                    mono_exception_signaled = true;
+                    cpu->jit->HaltExecution();
+                    return;
+                }
+                // Wait-retry if BLOCKED (same as MemoryReadCode)
+                int wait_count = 0;
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return;
+                    }
+                    if (++wait_count > 100000) {
+                        LOG_ERROR("Mono write exception signal timeout for thread {}", parent->thread_id);
+                        break;
+                    }
+                }
+            }
             return;
         }
 

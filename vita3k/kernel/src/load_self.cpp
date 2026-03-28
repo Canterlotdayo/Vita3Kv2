@@ -769,6 +769,29 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             kernel.mono_code_end = segment_reloc_info[0].addr + segment_reloc_info[0].size;
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
+
+            // Patch mono-vita's internal fallback stubs.
+            // mono-vita has ~159 functions compiled as "mvn r0, #0; bx lr" (return -1).
+            // These are fallbacks for functions normally provided by SceLibMonoBridge
+            // on real Vita. Returning -1 is wrong: getenv(-1) is treated as a non-null
+            // pointer, causing the debugger init to parse garbage → interpreter called
+            // with corrupted IL pointer (sl=1) → writes to invalid addresses → cascade.
+            // Patch to "mov r0, #0; bx lr" (return 0/NULL) which is correct:
+            // getenv returns NULL (no env vars on Vita), other functions return 0 (no-op).
+            Address code_start = segment_reloc_info[0].addr;
+            size_t code_size = segment_reloc_info[0].size;
+            uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
+            int patched = 0;
+            for (size_t i = 0; i < code_size / 4 - 1; i++) {
+                // Pattern: mvn r0, #0 (0xE3E00000) followed by bx lr (0xE12FFF1E)
+                if (code[i] == 0xE3E00000 && code[i + 1] == 0xE12FFF1E) {
+                    code[i] = 0xE3A00000; // mov r0, #0
+                    patched++;
+                }
+            }
+            if (patched > 0) {
+                LOG_INFO("Mono: patched {} internal fallback stubs (return -1 → return 0)", patched);
+            }
         }
         if (segment_reloc_info.count(1)) {
             kernel.mono_data_start = segment_reloc_info[1].addr;
