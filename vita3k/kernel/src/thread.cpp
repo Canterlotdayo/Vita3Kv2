@@ -288,6 +288,13 @@ bool ThreadState::run_loop() {
                     res = step(*cpu);
                     to_do = ThreadToDo::suspend;
                 } else {
+                    // Save context before run() for Mono exception recovery.
+                    // If a fault happens during run(), the registers will be
+                    // corrupted by the time the handler reads them. This snapshot
+                    // gives us clean registers from before the faulting block.
+                    if (is_mono_thread) {
+                        cpu->pre_run_context = save_context(*cpu);
+                    }
                     res = run(*cpu);
                 }
 

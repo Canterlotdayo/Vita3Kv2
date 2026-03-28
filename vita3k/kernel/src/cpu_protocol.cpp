@@ -95,16 +95,16 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
 
     LOG_WARN("signal_mono_exception: thread {}, fault_pc=0x{:08X}", thread_id, fault_pc);
 
-    // Save the full CPU context NOW, before the thread continues executing
-    // (Dynarmic may continue the current JIT block, corrupting all registers).
-    // GetThreadContextForVM will use this saved context instead of the live one.
+    // Use the pre-run context (saved before run() in the run_loop).
+    // This is a clean snapshot from before the faulting JIT block executed.
+    // The live context is corrupted because Dynarmic partially executed the block
+    // (NOPs, zero reads) before the callback could stop it.
     auto faulting_thread = kernel->get_thread(thread_id);
     if (faulting_thread) {
         {
             std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
-            kernel->mono_exception_saved_context = save_context(*faulting_thread->cpu);
-            // Override PC with the actual fault PC (the current PC might already
-            // be wrong if Dynarmic advanced past the faulting instruction)
+            kernel->mono_exception_saved_context = faulting_thread->cpu->pre_run_context;
+            // Override PC with the actual fault PC
             kernel->mono_exception_saved_context.cpu_registers[15] = fault_pc;
         }
         faulting_thread->suspend();

@@ -42,4 +42,11 @@ struct CPUState {
     // Set for Mono threads that need serialization to prevent race conditions.
     // When false, the thread runs at full speed with no tick overhead.
     bool use_mono_scheduling = false;
+
+    // Saved CPU context from before the last run() call. Used by the Mono
+    // exception handler to get a clean register state at the point before
+    // the faulting basic block executed. This avoids the problem of Dynarmic
+    // corrupting registers while finishing a partially-executed JIT block
+    // after signal_mono_exception.
+    CPUContext pre_run_context;
 };
