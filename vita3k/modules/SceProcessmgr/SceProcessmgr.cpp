@@ -105,16 +105,18 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const char *tname = thread ? thread->name.c_str() : "unknown";
-    LOG_WARN("Abort handler called on thread {} (ID: {}), params: 0x{:X}, 0x{:X}",
-             tname, thread_id, param1, param2);
+    
+    uint32_t pc = 0, lr = 0;
+    if (thread && thread->cpu) {
+        pc = read_pc(*thread->cpu);
+        lr = read_lr(*thread->cpu);
+    }
+    
+    LOG_ERROR("AbortHandler: thread {} (ID: {}), params: 0x{:X}, 0x{:X}, PC=0x{:08X}, LR=0x{:08X}",
+             tname, thread_id, param1, param2, pc, lr);
 
-    // For Mono threads, the abort is typically caused by a benign race condition
-    // in mono_class_init ("pending init"). On the real Vita this doesn't happen
-    // because threads on the same core are time-sliced. Killing the thread would
-    // corrupt Mono's runtime state and freeze the game. Instead, just return —
-    // the Mono runtime will handle the situation internally.
     if (thread && thread->name.find("Mono") != std::string::npos) {
-        LOG_WARN("Abort on Mono thread {} — NOT killing, returning to let Mono continue", thread_id);
+        LOG_ERROR("AbortHandler: Mono thread {} — NOT killing, returning 0", thread_id);
         return 0;
     }
 

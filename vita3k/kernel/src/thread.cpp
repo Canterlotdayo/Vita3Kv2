@@ -270,22 +270,14 @@ bool ThreadState::run_loop() {
             // - A background timer thread calls halt_execution() every ~1ms
             //   on the active thread, forcing run() to return (preemption).
             // - No cycle counting = zero JIT overhead.
-            // Event-driven Mono thread serialization.
-            //
-            // Like the real Vita kernel: threads switch at syscall boundaries.
-            // The mutex is held during guest code execution (run()) and released
-            // when the thread makes a kernel call (SVC). This is zero overhead:
-            // no cycle counting, no timer thread, no quantum.
-            //
-            // Only Mono threads are serialized. All other threads run freely.
-            //
-            // With enable_cycle_counting=false, run() returns only on SVC or
-            // halt — exactly when the real Vita kernel would context-switch.
+            // Event-driven Mono thread serialization with diagnostics.
             {
             const bool is_mono_thread = (name.find("Mono") != std::string::npos);
 
             if (is_mono_thread) {
+                LOG_TRACE("Mono mutex ACQUIRE attempt: thread {} ({})", name, id);
                 kernel.mono_thread_mutex.lock();
+                LOG_TRACE("Mono mutex ACQUIRED: thread {} ({})", name, id);
             }
 
             // Run the cpu
@@ -299,19 +291,23 @@ bool ThreadState::run_loop() {
 
                 // handle svc call if this was what stopped the cpu
                 if (cpu->svc_called) {
-                    // Release mutex at SVC boundary — this is where the real
-                    // Vita kernel would potentially context-switch.
                     if (is_mono_thread) {
+                        LOG_TRACE("Mono mutex RELEASE (SVC 0x{:X}): thread {} ({})",
+                                  cpu->svc, name, id);
                         kernel.mono_thread_mutex.unlock();
                     }
                     cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
                     if (is_mono_thread) {
+                        LOG_TRACE("Mono mutex RE-ACQUIRE attempt: thread {} ({})", name, id);
                         kernel.mono_thread_mutex.lock();
+                        LOG_TRACE("Mono mutex RE-ACQUIRED: thread {} ({})", name, id);
                     }
                 }
             } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
 
             if (is_mono_thread) {
+                LOG_TRACE("Mono mutex RELEASE (exit loop): thread {} ({}), to_do={}, res={}",
+                          name, id, static_cast<int>(to_do), res);
                 kernel.mono_thread_mutex.unlock();
             }
             } // end mono serialization block
