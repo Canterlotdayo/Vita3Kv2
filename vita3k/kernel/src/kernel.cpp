@@ -196,23 +196,21 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
         thread->cpu->use_mono_scheduling = true;
     }
 
-    // Register actual Mono workers in the GC hash table and exception table.
-    // Not ExceptionHandlerThread (it manages exceptions, doesn't need GC tracking).
+    // Register actual Mono workers in the exception table only.
+    // The GC hash table is managed by Mono's own GC_register_my_thread —
+    // we must NOT write to it (duplicates cause infinite loops during GC).
+    // We only need the exception table so the Mono exception callback
+    // finds the thread and returns r0≠0 (enabling NullReferenceException dispatch).
     if (is_mono_worker && !is_exception_handler && mono_data_start != 0) {
-        constexpr uint32_t GC_HASH_TABLE_OFFSET = 0x67A10;
         constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
         constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
-        constexpr uint32_t GC_ENTRY_SIZE = 0x24; // 36 bytes
 
         Address ep = entry_point.address();
-        Address stack_bottom = thread->stack_top() - stack_size;
-        Address stack_top_addr = thread->stack_top();
 
-        // The Mono GC callback searches by pthread_self return value (pthread_t),
-        // NOT by SceUID. The game's pthread.suprx returns a pointer to the
-        // pthread struct as the thread handle. This value appears as the hex
-        // prefix in thread names like "8BC449B0 Mono".
-        // Extract it from the name; fall back to SceUID if parsing fails.
+        // The Mono exception callback searches by pthread_self return value,
+        // which is the pthread_t handle (pointer to pthread struct).
+        // The game names threads "8BC449B0 Mono" where the hex prefix IS
+        // the pthread_t. Extract it; fall back to SceUID if parsing fails.
         uint32_t thread_id_val = static_cast<uint32_t>(thread->id);
         if (name) {
             char *end = nullptr;
@@ -222,27 +220,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
             }
         }
 
-        // --- GC Hash Table Registration ---
-        Address hash_table_addr = mono_data_start + GC_HASH_TABLE_OFFSET;
-        Address entry_addr = alloc(mem, GC_ENTRY_SIZE, "GC_thread_entry");
-        if (entry_addr) {
-            uint32_t hash = (thread_id_val & 0x7F);
-            Address bucket_addr = hash_table_addr + hash * 4;
-            uint32_t old_head = *Ptr<uint32_t>(bucket_addr).get(mem);
-
-            uint32_t *entry = Ptr<uint32_t>(entry_addr).get(mem);
-            memset(entry, 0, GC_ENTRY_SIZE);
-            entry[0] = old_head;
-            entry[1] = thread_id_val;
-            entry[4] = stack_bottom;
-            entry[6] = stack_top_addr;
-
-            *Ptr<uint32_t>(bucket_addr).get(mem) = entry_addr;
-        }
-
         // --- Exception Table Registration ---
-        // Only write if counter is sane (0-255). Before Mono runtime init,
-        // the counter contains garbage → skip to avoid out-of-bounds write.
         Address counter_addr = mono_data_start + EXCEPTION_COUNTER_OFFSET;
         Address table_addr = mono_data_start + EXCEPTION_TABLE_OFFSET;
         uint32_t *counter = Ptr<uint32_t>(counter_addr).get(mem);
