@@ -782,16 +782,20 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             size_t code_size = segment_reloc_info[0].size;
             uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
             int patched = 0;
-            for (size_t i = 0; i < code_size / 4 - 1; i++) {
-                // Pattern: mvn r0, #0 (0xE3E00000) followed by bx lr (0xE12FFF1E)
-                if (code[i] == 0xE3E00000 && code[i + 1] == 0xE12FFF1E) {
-                    code[i] = 0xE3A00000; // mov r0, #0
-                    patched++;
+            if (code) {
+                LOG_INFO("Mono stub scan: code_start=0x{:08X} code_size=0x{:X} first_word=0x{:08X}",
+                         code_start, code_size, code[0]);
+                for (size_t i = 0; i < code_size / 4 - 1; i++) {
+                    // Pattern: mvn r0, #0 (0xE3E00000) followed by bx lr (0xE12FFF1E)
+                    if (code[i] == 0xE3E00000 && code[i + 1] == 0xE12FFF1E) {
+                        code[i] = 0xE3A00000; // mov r0, #0
+                        patched++;
+                    }
                 }
+            } else {
+                LOG_ERROR("Mono stub scan: code pointer is NULL for address 0x{:08X}", code_start);
             }
-            if (patched > 0) {
-                LOG_INFO("Mono: patched {} internal fallback stubs (return -1 → return 0)", patched);
-            }
+            LOG_INFO("Mono: patched {} internal fallback stubs (return -1 → return 0)", patched);
         }
         if (segment_reloc_info.count(1)) {
             kernel.mono_data_start = segment_reloc_info[1].addr;
