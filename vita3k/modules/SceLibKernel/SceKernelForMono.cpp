@@ -163,42 +163,6 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         }
     }
 
-        Address table_addr = emuenv.kernel.mono_data_start + EXCEPTION_TABLE_OFFSET;
-        Address counter_addr = emuenv.kernel.mono_data_start + EXCEPTION_COUNTER_OFFSET;
-        uint32_t *counter = Ptr<uint32_t>(counter_addr).get(emuenv.mem);
-        uint32_t count = *counter;
-
-        // Check if already registered
-        bool found = false;
-        if (count < 256) {
-            uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
-            for (uint32_t i = 0; i < count && !found; i++) {
-                if (table[i]) {
-                    uint32_t *entry = Ptr<uint32_t>(table[i]).get(emuenv.mem);
-                    if (entry && entry[0] == pthread_id) {
-                        found = true;
-                    }
-                }
-            }
-        }
-
-        if (!found && count < 256) {
-            Address exc_entry = alloc(emuenv.mem, 8, "GC_exc_entry");
-            if (exc_entry) {
-                uint32_t *exc = Ptr<uint32_t>(exc_entry).get(emuenv.mem);
-                exc[0] = pthread_id;
-                exc[1] = 0;
-
-                uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
-                table[count] = exc_entry;
-                *counter = count + 1;
-
-                LOG_WARN("Mono exception table: registered faulting thread '{}' (pthread_t=0x{:08X}) at idx={}",
-                         faulting_thread->name, pthread_id, count);
-            }
-        }
-    }
-
     LOG_WARN("sceKernelWaitExceptionForMono: woke up! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
              faulting_tid, fault_addr, fault_pc);
 
