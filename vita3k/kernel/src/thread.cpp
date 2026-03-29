@@ -15,651 +15,435 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-#include "cpu/common.h"
-#include <cpu/impl/dynarmic_cpu.h>
-#include <cpu/state.h>
-#include <util/bit_cast.h>
+#include <cpu/functions.h>
+#include <kernel/thread/thread_state.h>
+
+#include <thread>
+
+#include <kernel/state.h>
+#include <mem/ptr.h>
+#include <util/align.h>
+
 #include <util/log.h>
 
-#include <mem/ptr.h>
-
-#include <dynarmic/frontend/A32/a32_ir_emitter.h>
-#include <dynarmic/interface/A32/coprocessor.h>
-#include <dynarmic/interface/exclusive_monitor.h>
-
+#include <cassert>
+#include <cstring>
 #include <memory>
-#include <chrono>
-#include <thread>
-#include <optional>
-#include <string>
-
-class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
-    uint32_t tpidruro;
-
-public:
-    using CoprocReg = Dynarmic::A32::CoprocReg;
-
-    explicit ArmDynarmicCP15()
-        : tpidruro(0) {
-    }
-
-    ~ArmDynarmicCP15() override = default;
-
-    std::optional<Callback> CompileInternalOperation(bool two, unsigned opc1, CoprocReg CRd,
-        CoprocReg CRn, CoprocReg CRm,
-        unsigned opc2) override {
-        return std::nullopt;
-    }
-
-    CallbackOrAccessOneWord CompileSendOneWord(bool two, unsigned opc1, CoprocReg CRn,
-        CoprocReg CRm, unsigned opc2) override {
-        return CallbackOrAccessOneWord{};
-    }
-
-    CallbackOrAccessTwoWords CompileSendTwoWords(bool two, unsigned opc, CoprocReg CRm) override {
-        return CallbackOrAccessTwoWords{};
-    }
-
-    CallbackOrAccessOneWord CompileGetOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm,
-        unsigned opc2) override {
-        if (CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 3) {
-            return &tpidruro;
-        }
-
-        return CallbackOrAccessOneWord{};
-    }
-
-    CallbackOrAccessTwoWords CompileGetTwoWords(bool two, unsigned opc, CoprocReg CRm) override {
-        return CallbackOrAccessTwoWords{};
-    }
-
-    std::optional<Callback> CompileLoadWords(bool two, bool long_transfer, CoprocReg CRd,
-        std::optional<std::uint8_t> option) override {
-        return std::nullopt;
-    }
-
-    std::optional<Callback> CompileStoreWords(bool two, bool long_transfer, CoprocReg CRd,
-        std::optional<std::uint8_t> option) override {
-        return std::nullopt;
-    }
-
-    void set_tpidruro(uint32_t tpidruro) {
-        this->tpidruro = tpidruro;
-    }
-
-    uint32_t get_tpidruro() const {
-        return tpidruro;
-    }
-};
-
-class ArmDynarmicCallback : public Dynarmic::A32::UserCallbacks {
-    friend class DynarmicCPU;
-
-    CPUState *parent;
-    DynarmicCPU *cpu;
-
-public:
-    explicit ArmDynarmicCallback(CPUState &parent, DynarmicCPU &cpu)
-        : parent(&parent)
-        , cpu(&cpu) {}
-
-    ~ArmDynarmicCallback() override = default;
-
-    std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr addr) override {
-        if (cpu->log_mem)
-            LOG_TRACE("Instruction fetch at address 0x{:X}", addr);
-
-        // Handle null function pointer calls (PC in first page = null pointer deref)
-        if (addr < parent->mem->page_size) {
-            auto lr = cpu->get_lr();
-
-            // If we already signaled a Mono exception for this thread during this
-            // run() call, just return NOP. Don't redirect PC — the exception handler
-            // will set the correct PC via SetThreadContextForMono after we're suspended.
-            // HaltExecution was already called; we're just waiting for Dynarmic to
-            // finish the current basic block and return from run().
-            if (mono_exception_signaled) {
-                return 0xE320F000;
-            }
-
-            // Try to signal the Mono exception handler. If Mono is loaded and
-            // the handler thread is waiting, this suspends the current thread
-            // and wakes the handler. Mono will modify our CPU context to jump
-            // to the C# exception handler and resume us.
-            if (parent->protocol &&
-                parent->protocol->signal_mono_exception(parent->thread_id, addr, lr, true)) {
-                mono_exception_signaled = true;
-                cpu->jit->HaltExecution();
-                return 0xE320F000;
-            }
-
-            // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // sleep briefly to give the handler thread CPU time to process the
-            // pending exception. Without this sleep, run() returns immediately
-            // (halted=false → res=0), run_loop re-enters run(), and this thread
-            // burns 100% CPU spinning on BLOCKED — starving the handler thread.
-            if (parent->protocol) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                cpu->jit->HaltExecution();
-                return 0xE320F000;
-            }
-
-            // Fallback for non-Mono games or when handler isn't ready:
-            // return to LR with r0=0, throttle logging
-            if (lr == last_null_caller_lr) {
-                null_call_count++;
-            } else {
-                last_null_caller_lr = lr;
-                null_call_count = 1;
-            }
-            if (null_call_count <= 4) {
-                LOG_WARN("Null function pointer call (PC=0x{:X}, LR=0x{:X}) - returning to caller", addr, lr);
-            }
-
-            cpu->jit->Regs()[0] = 0;
-            cpu->set_pc(lr);
-            cpu->jit->HaltExecution();
-            return 0xE320F000;
-        }
-
-        return MemoryRead32(addr);
-    }
-
-    // Track null function pointer call loops (fallback only)
-    Dynarmic::A32::VAddr last_null_caller_lr = 0;
-    uint32_t null_call_count = 0;
-
-    // Set when signal_mono_exception succeeds during a run() call.
-    // Prevents the fallback path from redirecting PC on subsequent
-    // MemoryReadCode callbacks in the same basic block.
-    bool mono_exception_signaled = false;
-
-    static void TraceInstruction(uint64_t self_, uint64_t address, uint64_t is_thumb) {
-        ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
-
-        std::string disassembly = [&]() -> std::string {
-            if (!address || !Ptr<uint32_t>{ (uint32_t)address }.valid(*self.parent->mem)) {
-                return "invalid address";
-            }
-            return disassemble(*self.parent, address);
-        }();
-        LOG_TRACE("{} ({}): {} {}", log_hex(self_), self.parent->thread_id, log_hex(address), disassembly);
-    }
-
-    void PreCodeTranslationHook(bool is_thumb, Dynarmic::A32::VAddr pc, Dynarmic::A32::IREmitter &ir) override {
-        if (cpu->log_code) {
-            ir.CallHostFunction(&TraceInstruction, ir.Imm64((uint64_t)this), ir.Imm64(pc), ir.Imm64(is_thumb));
-        }
-    }
-
-    template <typename T>
-    T MemoryRead(Dynarmic::A32::VAddr addr) {
-        Ptr<T> ptr{ addr };
-        if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
-            // If a Mono exception was already signaled in this run() call,
-            // just return 0 for all subsequent invalid reads in this basic block.
-            // Do NOT re-signal — the thread will be suspended after run() returns.
-            if (mono_exception_signaled) {
-                return 0;
-            }
-
-            auto pc = this->cpu->get_pc();
-
-            // Mono null-reference detection: on real Vita, accessing NULL+offset
-            // (e.g. ldr r0, [r1, #0x44] where r1=NULL) causes a data abort.
-            // The Vita maps the first 64KB as a guard region for null detection.
-            // We must use 64KB here, NOT the host page_size (16KB on macOS ARM64),
-            // otherwise null dereferences at offsets >16KB bypass Mono exception handling.
-            constexpr uint32_t MONO_NULL_PAGE_SIZE = 0x10000; // 64KB
-            if (addr < MONO_NULL_PAGE_SIZE && parent->protocol && !mono_exception_signaled) {
-                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc, false)) {
-                    mono_exception_signaled = true;
-                    cpu->jit->HaltExecution();
-                    return 0;
-                }
-                // If BLOCKED, sleep briefly to yield CPU to the handler thread.
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-
-            // If the PC itself is in invalid/unmapped memory, halt immediately.
-            {
-                Ptr<uint32_t> pc_check{ static_cast<uint32_t>(pc) };
-                if (pc && !pc_check.valid(*parent->mem)) {
-                    if (!mono_exception_signaled) {
-                        LOG_WARN("Thread executing in unmapped memory (PC=0x{:X}) - halting", pc);
-                    }
-                    cpu->jit->HaltExecution();
-                    return 0;
-                }
-            }
-
-            // Detect infinite loop: if the same PC keeps reading invalid addresses,
-            // the thread is stuck in a loop reading from a null object (e.g., iterating
-            // a null IEnumerator's vtable). After enough attempts, try to signal the
-            // Mono exception handler (which can redirect to a C# catch handler).
-            // If Mono isn't loaded or the handler isn't ready, fall back to the
-            // stack escape mechanism.
-            if (pc == last_invalid_read_pc) {
-                invalid_read_count++;
-            } else {
-                last_invalid_read_pc = pc;
-                invalid_read_count = 1;
-            }
-
-            if (invalid_read_count <= 4) {
-                LOG_ERROR("Invalid read of uint{}_t at address: 0x{:x}\n{}", sizeof(T) * 8, addr, this->cpu->save_context().description());
-                if (pc < parent->mem->page_size)
-                    LOG_CRITICAL("PC is 0x{:x}", pc);
-                else
-                    LOG_ERROR("Executing: {}", disassemble(*parent, pc, nullptr));
-            }
-
-            if (invalid_read_count > 8) {
-                // Fallback: scan the stack for a return address and force a return.
-                auto sp = cpu->jit->Regs()[13];
-                for (int i = 0; i < 32; i++) {
-                    uint32_t stack_val_addr = sp + i * 4;
-                    Ptr<uint32_t> sptr(stack_val_addr);
-                    if (!sptr.valid(*parent->mem))
-                        break;
-                    uint32_t val = *sptr.get(*parent->mem);
-                    if (val > parent->mem->page_size && val < 0x90000000 && val != pc) {
-                        LOG_WARN("Invalid read loop at PC=0x{:X} (count={}). "
-                                 "Escaping to 0x{:X} via stack[SP+0x{:X}]",
-                                 pc, invalid_read_count, val, i * 4);
-                        cpu->jit->Regs()[0] = 0; // return 0
-                        cpu->jit->Regs()[13] = stack_val_addr + 4; // pop stack
-                        cpu->set_pc(val);
-                        cpu->jit->HaltExecution();
-                        invalid_read_count = 0;
-                        last_invalid_read_pc = 0;
-                        return 0;
-                    }
-                }
-                // No escape found, just throttle the logging
-                if ((invalid_read_count & 0xFFF) == 0) {
-                    LOG_WARN("Invalid read loop at PC=0x{:X}, count={}, no escape found", pc, invalid_read_count);
-                }
-            }
-
-            return 0;
-        }
-
-        T ret = *ptr.get(*parent->mem);
-        if (cpu->log_mem) {
-            LOG_TRACE("Read uint{}_t at address: 0x{:x}, val = 0x{:x}", sizeof(T) * 8, addr, ret);
-        }
-        return ret;
-    }
-
-    // Track invalid read loops
-    Dynarmic::A32::VAddr last_invalid_read_pc = 0;
-    uint32_t invalid_read_count = 0;
-
-    uint8_t MemoryRead8(Dynarmic::A32::VAddr addr) override {
-        return MemoryRead<uint8_t>(addr);
-    }
-
-    uint16_t MemoryRead16(Dynarmic::A32::VAddr addr) override {
-        return MemoryRead<uint16_t>(addr);
-    }
-
-    uint32_t MemoryRead32(Dynarmic::A32::VAddr addr) override {
-        return MemoryRead<uint32_t>(addr);
-    }
-
-    uint64_t MemoryRead64(Dynarmic::A32::VAddr addr) override {
-        return MemoryRead<uint64_t>(addr);
-    }
-
-    template <typename T>
-    void MemoryWrite(Dynarmic::A32::VAddr addr, T value) {
-        Ptr<T> ptr{ addr };
-        if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
-            LOG_ERROR("Invalid write of uint{}_t at addr: 0x{:x}, val = 0x{:x}\n{}", sizeof(T) * 8, addr, value, this->cpu->save_context().description());
-
-            auto pc = this->cpu->get_pc();
-            if (pc < parent->mem->page_size)
-                LOG_CRITICAL("PC is 0x{:x}", pc);
-            else
-                LOG_ERROR("Executing: {}", disassemble(*parent, pc, nullptr));
-
-            // Don't signal Mono exception for wild pointer writes.
-            // On real Vita with MMU enabled, this would fault and kill the thread.
-            // But with memory mapping disabled, the original Vita3K code silently
-            // drops the write and continues. Signaling Mono here would suspend the
-            // thread, causing deadlocks when other threads depend on it.
-            // Only null page writes should trigger Mono exceptions (handled by
-            // the addr < page_size check in the if condition above returning early).
-            return;
-        }
-
-        *ptr.get(*parent->mem) = value;
-        if (cpu->log_mem) {
-            LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}", sizeof(T) * 8, addr, value);
-        }
-    }
-
-    void MemoryWrite8(Dynarmic::A32::VAddr addr, uint8_t value) override {
-        MemoryWrite<uint8_t>(addr, value);
-    }
-
-    void MemoryWrite16(Dynarmic::A32::VAddr addr, uint16_t value) override {
-        MemoryWrite<uint16_t>(addr, value);
-    }
-
-    void MemoryWrite32(Dynarmic::A32::VAddr addr, uint32_t value) override {
-        MemoryWrite<uint32_t>(addr, value);
-    }
-
-    void MemoryWrite64(Dynarmic::A32::VAddr addr, uint64_t value) override {
-        MemoryWrite<uint64_t>(addr, value);
-    }
-
-    template <typename T>
-    bool MemoryWriteExclusive(Dynarmic::A32::VAddr addr, T value, T expected) {
-        Ptr<T> ptr{ addr };
-        if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
-            LOG_ERROR("Invalid exclusive write of uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}\n{}", sizeof(T) * 8, addr, value, expected, this->cpu->save_context().description());
-
-            auto pc = this->cpu->get_pc();
-            if (pc < parent->mem->page_size)
-                LOG_CRITICAL("PC is 0x{:x}", pc);
-            else
-                LOG_ERROR("Executing: {}", disassemble(*parent, pc, nullptr));
-            return false;
-        }
-
-        auto result = Ptr<T>(addr).atomic_compare_and_swap(*parent->mem, value, expected);
-        if (cpu->log_mem) {
-            LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
-        }
-        return result;
-    }
-
-    bool MemoryWriteExclusive8(Dynarmic::A32::VAddr addr, uint8_t value, uint8_t expected) override {
-        return MemoryWriteExclusive(addr, value, expected);
-    }
-
-    bool MemoryWriteExclusive16(Dynarmic::A32::VAddr addr, uint16_t value, uint16_t expected) override {
-        return MemoryWriteExclusive(addr, value, expected);
-    }
-
-    bool MemoryWriteExclusive32(Dynarmic::A32::VAddr addr, uint32_t value, uint32_t expected) override {
-        return MemoryWriteExclusive(addr, value, expected);
-    }
-
-    bool MemoryWriteExclusive64(Dynarmic::A32::VAddr addr, uint64_t value, uint64_t expected) override {
-        return MemoryWriteExclusive(addr, value, expected); // Ptr<uint64_t>(addr).atomic_compare_and_swap(*parent->mem, value, expected);
-    }
-
-    void InterpreterFallback(Dynarmic::A32::VAddr addr, size_t num_insts) override {
-        LOG_ERROR("Unimplemented instruction at address {}:\n{}", log_hex(addr), save_context(*parent).description());
-    }
-
-    void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception exception) override {
-        switch (exception) {
-        case Dynarmic::A32::Exception::Breakpoint: {
-            cpu->break_ = true;
-            cpu->jit->HaltExecution();
-            if (cpu->is_thumb_mode())
-                cpu->set_pc(pc | 1);
-            else
-                cpu->set_pc(pc);
-            break;
-        }
-        case Dynarmic::A32::Exception::WaitForInterrupt: {
-            cpu->halted = true;
-            cpu->jit->HaltExecution();
-            break;
-        }
-        case Dynarmic::A32::Exception::PreloadDataWithIntentToWrite:
-        case Dynarmic::A32::Exception::PreloadData:
-        case Dynarmic::A32::Exception::PreloadInstruction:
-        case Dynarmic::A32::Exception::SendEvent:
-        case Dynarmic::A32::Exception::SendEventLocal:
-        case Dynarmic::A32::Exception::WaitForEvent:
-            break;
-        case Dynarmic::A32::Exception::Yield:
-            break;
-        case Dynarmic::A32::Exception::UndefinedInstruction:
-            LOG_WARN("Undefined instruction at address 0x{:X}, instruction 0x{:X} ({})", pc, MemoryReadCode(pc).value(), disassemble(*parent, pc, nullptr));
-            InterpreterFallback(pc, 1);
-            break;
-        case Dynarmic::A32::Exception::UnpredictableInstruction:
-            LOG_WARN("Unpredictable instruction at address 0x{:X}, instruction 0x{:X} ({})", pc, MemoryReadCode(pc).value(), disassemble(*parent, pc, nullptr));
-            InterpreterFallback(pc, 1);
-            break;
-        case Dynarmic::A32::Exception::DecodeError: {
-            LOG_WARN("Decode error at address 0x{:X}, instruction 0x{:X} ({})", pc, MemoryReadCode(pc).value(), disassemble(*parent, pc, nullptr));
-            InterpreterFallback(pc, 1);
-            break;
-        }
-        default:
-            LOG_WARN("Unknown exception {} Raised at pc = 0x{:x}", static_cast<size_t>(exception), pc);
-            LOG_TRACE("at address 0x{:X}, instruction 0x{:X} ({})", pc, MemoryReadCode(pc).value(), disassemble(*parent, pc, nullptr));
-        }
-    }
-
-    void CallSVC(uint32_t svc) override {
-        parent->svc_called = true;
-        parent->svc = svc;
-        cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
-    }
-
-    void AddTicks(uint64_t ticks) override {}
-
-    uint64_t GetTicksRemaining() override {
-        return 1ull << 60;
-    }
-};
-
-std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
-    Dynarmic::A32::UserConfig config{};
-    config.arch_version = Dynarmic::A32::ArchVersion::v7;
-    config.callbacks = cb.get();
-    if (parent->mem->use_page_table) {
-        config.page_table = (log_mem || !cpu_opt) ? nullptr : reinterpret_cast<decltype(config.page_table)>(parent->mem->page_table.get());
-        config.absolute_offset_page_table = true;
-    } else if (!log_mem && cpu_opt) {
-        config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
-    }
-    config.hook_hint_instructions = true;
-    config.enable_cycle_counting = false;
-    config.global_monitor = monitor;
-    config.coprocessors[15] = cp15;
-    config.processor_id = core_id;
-    config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
-
-    return std::make_unique<Dynarmic::A32::Jit>(config);
+#include <sstream>
+
+void ThreadSignal::wait() {
+    std::unique_lock<std::mutex> lock(mutex);
+    recv_cond.wait(lock, [&]() { return signaled; });
+    signaled = false;
 }
 
-DynarmicCPU::DynarmicCPU(CPUState *state, std::size_t processor_id, Dynarmic::ExclusiveMonitor *monitor, bool cpu_opt)
-    : parent(state)
-    , cb(std::make_unique<ArmDynarmicCallback>(*state, *this))
-    , cp15(std::make_shared<ArmDynarmicCP15>())
-    , monitor(monitor)
-    , core_id(processor_id)
-    , cpu_opt(cpu_opt) {
-    jit = make_jit();
+bool ThreadSignal::send() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (signaled) {
+        return false;
+    }
+    signaled = true;
+    recv_cond.notify_one();
+    return true;
 }
 
-DynarmicCPU::~DynarmicCPU() = default;
+int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option = nullptr) {
+    constexpr size_t KERNEL_TLS_SIZE = 0x800;
 
-int DynarmicCPU::run() {
-    halted = false;
-    break_ = false;
-    exit_request = false;
-    parent->svc_called = false;
-    cb->mono_exception_signaled = false;
-    Dynarmic::HaltReason halt_reason;
-    do {
-        halt_reason = jit->Run();
-    } while ((halt_reason == Dynarmic::HaltReason::Step) || (halt_reason == Dynarmic::HaltReason::CacheInvalidation));
+    // the stack size should be page-aligned
+    stack_size = align(stack_size, KiB(4));
 
-    return halted;
-}
+    this->name = name;
+    this->entry_point = entry_point.address();
 
-int DynarmicCPU::step() {
-    parent->svc_called = false;
-    jit->Step();
+    int core_num = kernel.corenum_allocator.new_corenum();
+    if (core_num < 0) {
+        LOG_ERROR("Out of core number to allocate, use 0");
+        core_num = 0;
+    }
+
+    if (init_priority > SCE_KERNEL_LOWEST_PRIORITY_USER) {
+        assert(SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY <= init_priority && init_priority <= SCE_KERNEL_LOWEST_DEFAULT_PRIORITY);
+        priority = init_priority - SCE_KERNEL_DEFAULT_PRIORITY + SCE_KERNEL_GAME_DEFAULT_PRIORITY_ACTUAL;
+    } else {
+        priority = init_priority;
+    }
+    this->affinity_mask = affinity_mask;
+    this->stack_size = stack_size;
+    start_tick = rtc_get_ticks(kernel.base_tick.tick);
+    last_vblank_waited = 0;
+
+    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem, kernel.cpu_protocol.get());
+    if (!cpu) {
+        return SCE_KERNEL_ERROR_ERROR;
+    }
+    if (kernel.debugger.watch_code) {
+        set_log_code(*cpu, true);
+    }
+    if (kernel.debugger.watch_memory) {
+        set_log_mem(*cpu, true);
+    }
+
+    std::string alloc_name = fmt::format("Stack for thread {} (#{})", name, id);
+    stack = alloc_block(mem, stack_size, alloc_name.c_str());
+    memset(stack.get_ptr<void>().get(mem), 0xcc, stack_size);
+
+    alloc_name = fmt::format("TLS for thread {} (#{})", name, id);
+    const size_t tls_size = KERNEL_TLS_SIZE + kernel.tls_msize;
+    tls = alloc_block(mem, tls_size, alloc_name.c_str());
+    const Ptr<uint8_t> base_tls_ptr = tls.get_ptr<uint8_t>();
+    memset(base_tls_ptr.get(mem), 0, tls_size);
+
+    int *tls_array = tls.get_ptr<int>().get(mem);
+
+    tls_array[TLS_PROCESS_ID] = 1; // stubbed. unused
+    tls_array[TLS_THREAD_ID] = id;
+    tls_array[TLS_SP_TOP] = stack.get();
+    tls_array[TLS_SP_BOTTOM] = stack.get() + stack_size;
+    tls_array[TLS_CURRENT_PRIORITY] = priority;
+    tls_array[TLS_CPU_AFFINITY_MASK] = affinity_mask;
+
+    const Ptr<uint8_t> user_tls_ptr = base_tls_ptr + KERNEL_TLS_SIZE;
+    write_tpidruro(*cpu, user_tls_ptr.address());
+    if (kernel.tls_address) {
+        assert(kernel.tls_psize <= kernel.tls_msize);
+        memcpy(user_tls_ptr.get(mem), kernel.tls_address.get(mem), kernel.tls_psize);
+    }
+
+    CPUContext ctx;
+    ctx.set_sp(stack_top());
+    if (option) {
+        ctx.cpu_registers[0] = option->attr;
+        ctx.cpu_registers[1] = option->size;
+    }
+    this->init_cpu_ctx = ctx;
+
     return 0;
 }
 
-bool DynarmicCPU::hit_breakpoint() {
-    return break_;
-}
-
-void DynarmicCPU::trigger_breakpoint() {
-    break_ = true;
-    stop();
-}
-
-void DynarmicCPU::set_log_code(bool log) {
-    if (log_code == log)
-        return;
-
-    log_code = log;
-    jit = make_jit();
-}
-
-void DynarmicCPU::set_log_mem(bool log) {
-    if (log_mem == log)
-        return;
-
-    log_mem = log;
-    jit = make_jit();
-}
-
-bool DynarmicCPU::get_log_code() {
-    return log_code;
-}
-
-bool DynarmicCPU::get_log_mem() {
-    return log_mem;
-}
-
-void DynarmicCPU::stop() {
-    exit_request = true;
-}
-
-void DynarmicCPU::halt_execution() {
-    jit->HaltExecution();
-}
-
-uint32_t DynarmicCPU::get_reg(uint8_t idx) {
-    return jit->Regs()[idx];
-}
-
-uint32_t DynarmicCPU::get_sp() {
-    return jit->Regs()[13];
-}
-
-uint32_t DynarmicCPU::get_pc() {
-    return jit->Regs()[15];
-}
-
-void DynarmicCPU::set_reg(uint8_t idx, uint32_t val) {
-    jit->Regs()[idx] = val;
-}
-
-void DynarmicCPU::set_cpsr(uint32_t val) {
-    jit->SetCpsr(val);
-}
-
-uint32_t DynarmicCPU::get_tpidruro() {
-    return cp15->get_tpidruro();
-}
-
-void DynarmicCPU::set_tpidruro(uint32_t val) {
-    cp15->set_tpidruro(val);
-}
-
-void DynarmicCPU::set_pc(uint32_t val) {
-    if (val & 1) {
-        set_cpsr(get_cpsr() | 0x20);
-        val = val & 0xFFFFFFFE;
-    } else {
-        set_cpsr(get_cpsr() & 0xFFFFFFDF);
-        val = val & 0xFFFFFFFC;
+void ThreadState::raise_waiting_threads() {
+    for (const auto &t : waiting_threads) {
+        const std::unique_lock<std::mutex> lock(t->mutex);
+        assert(t->status == ThreadStatus::wait);
+        t->status = ThreadStatus::run;
+        t->status_cond.notify_all();
     }
-    jit->Regs()[15] = val;
+    waiting_threads.clear();
 }
 
-void DynarmicCPU::set_lr(uint32_t val) {
-    jit->Regs()[14] = val;
+int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback) {
+    if (status == ThreadStatus::run || call_level > 0)
+        return SCE_KERNEL_ERROR_RUNNING;
+    std::unique_lock<std::mutex> thread_lock(mutex);
+
+    run_start_callback = run_entry_callback;
+    call_level = 1;
+    load_context(*cpu, init_cpu_ctx);
+    write_pc(*cpu, entry_point);
+    write_lr(*cpu, cpu->halt_instruction_pc);
+    write_reg(*cpu, 0, arglen);
+
+    // Copy data to stack
+    if (argp && arglen > 0) {
+        const Address data_addr = stack_alloc(*cpu, align(arglen, 8));
+        memcpy(Ptr<uint8_t>(data_addr).get(mem), argp.get(mem), arglen);
+        write_reg(*cpu, 1, data_addr);
+    } else {
+        write_reg(*cpu, 1, 0);
+    }
+
+    if (kernel.debugger.wait_for_debugger) {
+        to_do = ThreadToDo::suspend;
+        status = ThreadStatus::suspend;
+        kernel.debugger.wait_for_debugger = false;
+    } else {
+        to_do = ThreadToDo::run;
+        status = ThreadStatus::run;
+    }
+    something_to_do.notify_one();
+
+    return SCE_KERNEL_OK;
 }
 
-void DynarmicCPU::set_sp(uint32_t val) {
-    jit->Regs()[13] = val;
+void ThreadState::exit(SceInt32 status) {
+    std::lock_guard<std::mutex> guard(mutex);
+    run_end_callback = true;
+    call_level = 0;
+    returned_value = static_cast<uint32_t>(status);
 }
 
-uint32_t DynarmicCPU::get_cpsr() {
-    return jit->Cpsr();
+void ThreadState::exit_delete(bool exit) {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    run_end_callback = exit;
+
+    const ThreadToDo last_to_do = to_do;
+    to_do = ThreadToDo::remove;
+    if (last_to_do == ThreadToDo::wait) {
+        something_to_do.notify_one();
+    } else {
+        stop(*cpu);
+    }
+
+    // Wake if thread waiting on status_cond
+    if (status == ThreadStatus::wait)
+        update_status(ThreadStatus::run);
+
+    // Wake if thread waiting on sceKernelWaitSignal
+    signal.send();
 }
 
-uint32_t DynarmicCPU::get_fpscr() {
-    return jit->Fpscr();
+bool ThreadState::run_loop() {
+    int res = 0;
+    int run_level = std::max(call_level, 1);
+
+    std::unique_lock<std::mutex> lock(mutex);
+
+    auto run_thread_end_callback = [&]() {
+        if (!run_end_callback)
+            return;
+        run_end_callback = false;
+
+        if (!kernel.thread_event_end)
+            return;
+
+        ThreadToDo old_to_do = to_do;
+        int old_call_level = call_level;
+        uint32_t old_returned_value = returned_value;
+        to_do = ThreadToDo::run;
+        call_level = 1;
+
+        lock.unlock();
+        int ret = run_callback(kernel.thread_event_end.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_END, static_cast<uint32_t>(id), 0, kernel.thread_event_end_arg });
+        if (ret != 0)
+            LOG_WARN("Thread start event handler returned {}", log_hex(ret));
+        lock.lock();
+
+        to_do = old_to_do;
+        call_level = old_call_level;
+        returned_value = old_returned_value;
+    };
+
+    while (true) {
+        switch (to_do) {
+        case ThreadToDo::remove:
+            if (run_level == 1) {
+                run_thread_end_callback();
+                update_status(ThreadStatus::dormant);
+            }
+
+            return true;
+        case ThreadToDo::run:
+        case ThreadToDo::step:
+
+            if (call_level == 0) {
+                run_thread_end_callback();
+
+                // nothing to do
+                update_status(ThreadStatus::dormant);
+                to_do = ThreadToDo::wait;
+                break;
+            }
+
+            update_status(ThreadStatus::run);
+
+            lock.unlock();
+
+            if (run_start_callback) {
+                run_start_callback = false;
+
+                if (kernel.thread_event_start) {
+                    int ret = run_callback(kernel.thread_event_start.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_START, static_cast<uint32_t>(id), 0, kernel.thread_event_start_arg });
+                    if (ret != 0)
+                        LOG_WARN("Thread start event handler returned {}", log_hex(ret));
+                }
+            }
+
+            // Run the cpu
+            do {
+                if (to_do == ThreadToDo::step) {
+                    res = step(*cpu);
+                    to_do = ThreadToDo::suspend;
+                } else {
+                    cpu->pre_run_context = save_context(*cpu);
+                    res = run(*cpu);
+                }
+
+                // handle svc call if this was what stopped the cpu
+                if (cpu->svc_called) {
+                    cpu->protocol->call_svc(*cpu, cpu->svc_called, read_pc(*cpu), *this);
+                }
+            } while (to_do == ThreadToDo::run && res == 0 && call_level == run_level && !hit_breakpoint(*cpu));
+
+            lock.lock();
+
+            // Handle errors
+            if (to_do == ThreadToDo::remove)
+                continue;
+
+            if (res < 0) {
+                LOG_ERROR("Thread {} ({}) experienced a cpu error.", name, cpu->thread_id);
+                returned_value = 0xDEADDEAD;
+                call_level--;
+                if (call_level > 0)
+                    // only return if we are inside a callback
+                    return true;
+                break;
+            }
+
+            if (hit_breakpoint(*cpu) || to_do == ThreadToDo::suspend) {
+                update_status(ThreadStatus::suspend);
+                to_do = ThreadToDo::wait;
+            }
+
+            if (call_level < run_level && run_level > 1)
+                // exit requested, exit this callback now
+                return true;
+
+            if (res) {
+                returned_value = read_reg(*cpu, 0);
+                call_level--;
+                if (call_level > 0)
+                    // only return if we are inside a callback
+                    return true;
+            }
+            break;
+        case ThreadToDo::wait:
+            something_to_do.wait(lock);
+            break;
+        case ThreadToDo::suspend:
+            update_status(ThreadStatus::suspend);
+            something_to_do.wait(lock);
+            break;
+        }
+    }
 }
 
-void DynarmicCPU::set_fpscr(uint32_t val) {
-    jit->SetFpscr(val);
+void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
+    Address sp = read_sp(*cpu);
+    for (size_t i = 0; i < std::min(args.size(), static_cast<size_t>(4)); i++) {
+        write_reg(*cpu, i, args[i]);
+    }
+    if (args.size() > 4) {
+        // TODO align to 16 bytes
+        const size_t remain_size = args.size() - 4;
+        sp -= 4 * remain_size;
+        memcpy(Ptr<uint32_t>(sp).get(mem), &args[4], remain_size * 4);
+    }
+    write_sp(*cpu, sp);
 }
 
-CPUContext DynarmicCPU::save_context() {
-    CPUContext ctx;
-    ctx.cpu_registers = jit->Regs();
-    static_assert(sizeof(ctx.fpu_registers) == sizeof(jit->ExtRegs()));
-    memcpy(ctx.fpu_registers.data(), jit->ExtRegs().data(), sizeof(ctx.fpu_registers));
-    ctx.fpscr = jit->Fpscr();
-    ctx.cpsr = jit->Cpsr();
+uint32_t ThreadState::run_callback(Address callback_address, const std::vector<uint32_t> &args) {
+    if (call_level == 0) {
+        LOG_ERROR("run_callback should not be called as the first thread entry");
+        return 0;
+    }
 
-    return ctx;
+    // first save the current context
+    const CPUContext previous_ctx = save_context(*cpu);
+    const uint32_t previous_tpidruro = read_tpidruro(*cpu);
+
+    std::unique_lock<std::mutex> thread_lock(mutex);
+    call_level++;
+    // we shouldn't have to clean the context I believe
+    write_pc(*cpu, callback_address);
+    write_lr(*cpu, cpu->halt_instruction_pc);
+    push_arguments(args);
+    thread_lock.unlock();
+
+    // unlock but then immediately lock back in the run_loop function
+    // shouldn't cause an issue, but maybe we could use a recursive mutex instead
+    run_loop();
+
+    thread_lock.lock();
+
+    // restore the previous context
+    // actually, in most case I don't think this is necessary as the caller
+    // and the callee should respect the same calling convention
+    // but do it just in case
+    load_context(*cpu, previous_ctx);
+    write_tpidruro(*cpu, previous_tpidruro);
+
+    return returned_value;
 }
 
-void DynarmicCPU::load_context(const CPUContext &ctx) {
-    jit->Regs() = ctx.cpu_registers;
-    static_assert(sizeof(ctx.fpu_registers) == sizeof(jit->ExtRegs()));
-    memcpy(jit->ExtRegs().data(), ctx.fpu_registers.data(), sizeof(ctx.fpu_registers));
-    jit->SetCpsr(ctx.cpsr);
-    jit->SetFpscr(ctx.fpscr);
+uint32_t ThreadState::run_guest_function(Address callback_address, SceSize args, const Ptr<void> argp) {
+    // save the previous entry point, just in case
+    const auto old_entry_point = entry_point;
+    entry_point = callback_address;
+
+    start(args, argp);
+    {
+        // wait for the function to return
+        // Use polling with short sleep instead of condition_variable::wait
+        // to work around macOS pthread_cond_wait EINVAL bug
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (status == ThreadStatus::dormant && to_do != ThreadToDo::run) {
+                break;
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+
+    entry_point = old_entry_point;
+    return returned_value;
 }
 
-uint32_t DynarmicCPU::get_lr() {
-    return jit->Regs()[14];
+ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem)
+    : id(id)
+    , kernel(kernel)
+    , mem(mem) {
 }
 
-float DynarmicCPU::get_float_reg(uint8_t idx) {
-    return std::bit_cast<float>(jit->ExtRegs()[idx]);
+void ThreadState::update_status(ThreadStatus status, std::optional<ThreadStatus> expected) {
+    if (expected)
+        assert(expected.value() == this->status);
+
+    this->status = status;
+    status_cond.notify_all();
+
+    if (status == ThreadStatus::dormant) {
+        raise_waiting_threads();
+    }
 }
 
-void DynarmicCPU::set_float_reg(uint8_t idx, float val) {
-    jit->ExtRegs()[idx] = std::bit_cast<uint32_t>(val);
+Address ThreadState::stack_top() const {
+    return stack.get() + stack_size;
 }
 
-bool DynarmicCPU::is_thumb_mode() {
-    return jit->Cpsr() & 0x20;
+void ThreadState::suspend() {
+    if (to_do != ThreadToDo::run) {
+        // Thread already suspended (e.g., by signal_mono_exception before Mono calls SuspendThreadForMono)
+        return;
+    }
+    to_do = ThreadToDo::suspend;
+    stop(*cpu);
 }
 
-std::size_t DynarmicCPU::processor_id() const {
-    return core_id;
+void ThreadState::resume(bool step) {
+    assert(to_do == ThreadToDo::wait || to_do == ThreadToDo::suspend);
+
+    {
+        const auto thread_lock = std::lock_guard(mutex);
+        to_do = step ? ThreadToDo::step : ThreadToDo::run;
+    }
+    something_to_do.notify_one();
 }
 
-void DynarmicCPU::invalidate_jit_cache(Address start, size_t length) {
-    jit->InvalidateCacheRange(start, length);
-}
-
-// TODO: proper abstraction
-ExclusiveMonitorPtr new_exclusive_monitor(int max_num_cores) {
-    return new Dynarmic::ExclusiveMonitor(max_num_cores);
-}
-
-void free_exclusive_monitor(ExclusiveMonitorPtr monitor) {
-    Dynarmic::ExclusiveMonitor *monitor_ = static_cast<Dynarmic::ExclusiveMonitor *>(monitor);
-    delete monitor_;
-}
-
-void clear_exclusive(ExclusiveMonitorPtr monitor, std::size_t core_num) {
-    Dynarmic::ExclusiveMonitor *monitor_ = static_cast<Dynarmic::ExclusiveMonitor *>(monitor);
-    monitor_->ClearProcessor(core_num);
+std::string ThreadState::log_stack_traceback() const {
+    constexpr Address START_OFFSET = 0;
+    constexpr Address END_OFFSET = 1024;
+    std::string str;
+    const Address sp = read_sp(*cpu);
+    for (Address addr = sp - START_OFFSET; addr <= sp + END_OFFSET; addr += 4) {
+        if (Ptr<uint32_t>(addr).valid(mem)) {
+            const Address value = *Ptr<uint32_t>(addr).get(mem);
+            const auto mod = kernel.find_module_by_addr(value);
+            if (mod)
+                fmt::format_to(std::back_inserter(str), "0x{:X} (module: {})\n", value, mod->module_name);
+        }
+    }
+    return str;
 }
