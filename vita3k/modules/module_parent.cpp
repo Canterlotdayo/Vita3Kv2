@@ -308,7 +308,7 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
         // all 145 resolved imports (sceIoOpen, sceKernelWaitExceptionForMono, etc.).
         // Fix: re-write the correct stub code after module_start returns.
         if (std::string(module.path).find("mono-vita") != std::string::npos) {
-            const auto &kernel = emuenv.kernel;
+            auto &kernel = emuenv.kernel;
             const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
             int restored = 0;
             Address mono_code_start = kernel.mono_code_start;
