@@ -242,12 +242,21 @@ EXPORT(int, __tls_get_addr) {
     return UNIMPLEMENTED();
 }
 
-// _sceLdTlsRegisterModuleInfo and _sceLdTlsUnregisterModuleInfo are NOT
-// exported here. Games that ship their own libc.suprx provide real
-// implementations. Our HLE UNIMPLEMENTED stubs would override them
-// (HLE exports take priority over game module exports), silently breaking
-// all dynamic TLS registration — which breaks pthread TLS, which breaks
-// Mono exception handling in Unity games.
+// These HLE stubs exist only to satisfy the linker. They are removed from
+// export_nids during mono-vita loading (see load_self.cpp) so that the game's
+// own libc.suprx implementation handles TLS registration correctly.
+// Without this, the HLE stubs (returning 0/UNIMPLEMENTED) override the game's
+// real implementation, silently breaking all dynamic TLS — which breaks
+// pthread TLS, which breaks Mono exception handling in Unity games.
+EXPORT(int, _sceLdTlsRegisterModuleInfo) {
+    TRACY_FUNC(_sceLdTlsRegisterModuleInfo);
+    return UNIMPLEMENTED();
+}
+
+EXPORT(int, _sceLdTlsUnregisterModuleInfo) {
+    TRACY_FUNC(_sceLdTlsUnregisterModuleInfo);
+    return UNIMPLEMENTED();
+}
 
 EXPORT(Ptr<int>, _sceLibcErrnoLoc) {
     TRACY_FUNC(_sceLibcErrnoLoc);

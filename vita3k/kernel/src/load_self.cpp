@@ -264,7 +264,7 @@ static bool load_func_exports(SceKernelModuleInfo *kernel_module_info, const uin
             continue;
         }
 
-        kernel.export_nids.emplace(nid, entry.address());
+        kernel.export_nids[nid] = entry.address();
         // substitute supervisor calls to direct function calls in loaded modules
         auto range = kernel.func_binding_infos.equal_range(nid);
         for (auto it = range.first; it != range.second; ++it) {
