@@ -124,7 +124,19 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
 
             Address best_pc;
             if (is_prefetch) {
-                best_pc = fault_pc; // = LR from MemoryReadCode (caller address)
+                // PREFETCH abort: null function pointer call.
+                // The pattern is: "mov lr, pc; ldr pc, [rN, #offset]"
+                // "mov lr, pc" sets LR = address_of_next_instruction (the call site).
+                // "ldr pc, [rN]" loads PC from a null vtable entry → PC=0 → fault.
+                //
+                // fault_pc = stale LR from get_lr() during MemoryReadCode callback.
+                //   Dynarmic hasn't committed the "mov lr, pc" yet → wrong value.
+                // committed LR (from save_context after run()) = the CORRECT LR
+                //   set by "mov lr, pc" → points to the exact call site.
+                //
+                // Mono uses this PC to find JIT metadata for the calling method.
+                // The call site address is what Mono needs to locate the catch handler.
+                best_pc = lr; // = committed LR from save_context (accurate after run())
             } else {
                 if (committed_pc >= 0x80000000 && committed_pc < 0x90000000) {
                     best_pc = committed_pc;
