@@ -127,16 +127,14 @@ public:
             // and wakes the handler. Mono will modify our CPU context to jump
             // to the C# exception handler and resume us.
             if (parent->protocol &&
-                parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
+                parent->protocol->signal_mono_exception(parent->thread_id, addr, lr, true)) {
                 mono_exception_signaled = true;
                 cpu->jit->HaltExecution();
                 return 0xE320F000;
             }
 
             // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // halt and return NOP. Don't busy-wait — that deadlocks because the
-            // handler thread needs CPU time to process the pending exception.
-            // The thread will be re-run after the pending exception is handled.
+            // halt and return NOP. Don't busy-wait — the handler thread needs CPU time.
             if (parent->protocol) {
                 cpu->jit->HaltExecution();
                 return 0xE320F000;
@@ -196,12 +194,7 @@ public:
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
             // If a Mono exception was already signaled in this run() call,
             // just return 0 for all subsequent invalid reads in this basic block.
-            // Do NOT re-signal — that caused an infinite fault loop because:
-            // 1) save_context() during MemoryRead returns stale registers
-            // 2) Mono receives wrong context → sets wrong recovery PC
-            // 3) Thread re-faults immediately → cycle repeats forever
-            // The thread will be suspended after HaltExecution takes effect
-            // and run() returns with committed register state.
+            // Do NOT re-signal — the thread will be suspended after run() returns.
             if (mono_exception_signaled) {
                 return 0;
             }
@@ -209,24 +202,18 @@ public:
             auto pc = this->cpu->get_pc();
 
             // Mono null-reference detection: on real Vita, accessing NULL+offset
-            // (for object field reads like ldr r0, [r1, #0x44] where r1=NULL)
-            // causes a data abort that the kernel signals to Mono's exception
-            // handler. The Vita maps the first 64KB as a guard region.
+            // (e.g. ldr r0, [r1, #0x44] where r1=NULL) causes a data abort.
+            // The Vita maps the first 64KB as a guard region for null detection.
             // We must use 64KB here, NOT the host page_size (16KB on macOS ARM64),
-            // otherwise null dereferences at offsets >16KB are missed and cause
-            // the thread to enter the generic "invalid read" path instead of
-            // being properly handled by Mono as NullReferenceException.
+            // otherwise null dereferences at offsets >16KB bypass Mono exception handling.
             constexpr uint32_t MONO_NULL_PAGE_SIZE = 0x10000; // 64KB
             if (addr < MONO_NULL_PAGE_SIZE && parent->protocol && !mono_exception_signaled) {
-                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc, false)) {
                     mono_exception_signaled = true;
                     cpu->jit->HaltExecution();
                     return 0;
                 }
-                // Signal was BLOCKED (another exception pending). Don't busy-wait.
-                // Return 0 and let the basic block finish. The thread will be
-                // re-scheduled and can retry. Busy-waiting here deadlocks because
-                // the handler thread needs CPU time to process the pending exception.
+                // If BLOCKED, don't busy-wait. Just halt and let the scheduler retry.
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
@@ -237,7 +224,7 @@ public:
                 if (pc && !pc_check.valid(*parent->mem)) {
                     if (!mono_exception_signaled) {
                         if (parent->protocol &&
-                            parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                            parent->protocol->signal_mono_exception(parent->thread_id, addr, pc, false)) {
                             LOG_WARN("Thread at unmapped PC=0x{:X} — signaled Mono exception handler", pc);
                             mono_exception_signaled = true;
                             cpu->jit->HaltExecution();
@@ -275,7 +262,7 @@ public:
                 // Try to signal Mono exception handler first — it can properly
                 // redirect execution to a C# catch block.
                 if (parent->protocol &&
-                    parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                    parent->protocol->signal_mono_exception(parent->thread_id, addr, pc, false)) {
                     LOG_WARN("Invalid read loop at PC=0x{:X} — signaled Mono exception handler", pc);
                     mono_exception_signaled = true;
                     cpu->jit->HaltExecution();
@@ -359,12 +346,12 @@ public:
             // writes garbage to shared heap, causing cascading crashes.
             if (parent->protocol && !mono_exception_signaled) {
                 auto lr = cpu->get_lr();
-                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc, false)) {
                     mono_exception_signaled = true;
                     cpu->jit->HaltExecution();
                     return;
                 }
-                // If BLOCKED, don't busy-wait. Halt and let the scheduler retry.
+                // If BLOCKED, halt and let the scheduler retry.
                 cpu->jit->HaltExecution();
             }
             return;

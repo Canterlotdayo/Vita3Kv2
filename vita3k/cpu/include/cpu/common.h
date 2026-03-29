@@ -49,7 +49,7 @@ struct CPUProtocolBase {
     // false otherwise (caller should handle the fault itself).
     // When true is returned, the faulting thread has been suspended and will be resumed
     // by Mono after it processes the exception.
-    virtual bool signal_mono_exception(int thread_id, Address fault_addr, Address fault_pc) { return false; }
+    virtual bool signal_mono_exception(int thread_id, Address fault_addr, Address fault_pc, bool is_prefetch = false) { return false; }
 
     virtual ~CPUProtocolBase() = default;
 };

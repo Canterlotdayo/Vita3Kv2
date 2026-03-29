@@ -68,17 +68,19 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     SceUID faulting_tid;
     Address fault_addr;
     Address fault_pc;
+    bool is_prefetch;
     {
         std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
         faulting_tid = emuenv.kernel.mono_exception_thread_id;
         fault_addr = emuenv.kernel.mono_exception_fault_addr;
         fault_pc = emuenv.kernel.mono_exception_fault_pc;
+        is_prefetch = emuenv.kernel.mono_exception_is_prefetch;
         emuenv.kernel.mono_exception_pending = false;
     }
 
     // Wait for the faulting thread to actually reach suspend state.
     // This is CRITICAL: we must wait until Dynarmic's run() has returned
-    // and the thread's run_loop has reached the suspend wait. Only then
+    // and the thread's run_loop has reached the suspend wait point. Only then
     // has Dynarmic committed all guest registers to JitState, making
     // save_context() return accurate values.
     auto faulting_thread = emuenv.kernel.get_thread(faulting_tid);
@@ -95,13 +97,8 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
 
-        // *** FIX: Save the context NOW, after run() has returned. ***
-        //
-        // At this point Dynarmic has fully committed all guest registers
-        // back to JitState. save_context() will return the accurate r0-r14
-        // state. We only need to override PC with the fault_pc, since
-        // Dynarmic sets PC to the end of the last executed basic block
-        // rather than the exact faulting instruction.
+        // Save the context NOW, after run() has returned and registers are committed.
+        // Override PC with fault_pc since Dynarmic's PC points to the block end.
         {
             std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
             emuenv.kernel.mono_exception_saved_context = save_context(*faulting_thread->cpu);
@@ -114,14 +111,21 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     }
 
     // Write exception info into the output structure.
+    // Layout matches the real Vita kernel's SCE exception info struct:
+    //   +0x00 (info[0]): size (0x18, already set by caller)
+    //   +0x04 (info[1]): exception type (0x10=prefetch abort, 0x20=data abort)
+    //   +0x08 (info[2]): faulting thread SceUID
+    //   +0x0C (info[3]): fault address
+    //   +0x10 (info[4]): program counter at fault
+    //   +0x14 (info[5]): DFSR/IFSR status register (0)
     if (pInfo) {
         uint32_t *info = pInfo.get(emuenv.mem);
         // info[0] = size, already set by caller (0x18)
-        info[1] = static_cast<uint32_t>(faulting_tid);  // SceUID
-        info[2] = fault_addr;
-        info[3] = fault_pc;
-        info[4] = 0x101;  // exception type
-        info[5] = 0;
+        info[1] = is_prefetch ? 0x10 : 0x20;               // exception type
+        info[2] = static_cast<uint32_t>(faulting_tid);      // faulting thread ID
+        info[3] = fault_addr;                               // fault address
+        info[4] = fault_pc;                                 // PC at fault
+        info[5] = 0;                                        // DFSR/IFSR (not emulated)
     }
 
     LOG_WARN("sceKernelWaitExceptionForMono: woke up! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",

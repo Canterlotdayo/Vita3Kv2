@@ -179,7 +179,8 @@ struct KernelState {
     SceUID mono_exception_thread_id = 0;       // faulting thread ID
     Address mono_exception_fault_addr = 0;     // address that caused the fault
     Address mono_exception_fault_pc = 0;       // PC at time of fault
-    CPUContext mono_exception_saved_context;    // full CPU context saved AFTER run() returns
+    bool mono_exception_is_prefetch = false;   // true=prefetch abort (code fetch), false=data abort (read/write)
+    CPUContext mono_exception_saved_context;    // full CPU context saved AFTER run() returns (accurate)
     int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
     std::set<SceUID> mono_exception_dead_threads; // threads that died on double-fault (like real Vita)
     bool mono_callback_invokers_patched = false;  // true after runtime callback invoker stubs are patched
