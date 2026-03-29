@@ -63,11 +63,14 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         if (prev_tid != 0) {
             auto prev_thread = emuenv.kernel.get_thread(prev_tid);
             if (prev_thread) {
-                std::lock_guard<std::mutex> tlock(prev_thread->mutex);
-                if (prev_thread->status == ThreadStatus::suspend) {
+                bool needs_resume = false;
+                {
+                    std::lock_guard<std::mutex> tlock(prev_thread->mutex);
+                    needs_resume = (prev_thread->status == ThreadStatus::suspend);
+                }
+                if (needs_resume) {
                     LOG_WARN("WaitExceptionForMono: previous faulting thread {} still suspended — forcing resume (unhandled exception)", prev_tid);
-                    prev_thread->to_do = ThreadToDo::run;
-                    prev_thread->something_to_do.notify_one();
+                    prev_thread->resume();
                 }
             }
             emuenv.kernel.mono_exception_thread_id = 0;
