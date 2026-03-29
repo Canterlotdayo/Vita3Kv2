@@ -134,8 +134,12 @@ public:
             }
 
             // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // halt and return NOP. Don't busy-wait — the handler thread needs CPU time.
+            // sleep briefly to give the handler thread CPU time to process the
+            // pending exception. Without this sleep, run() returns immediately
+            // (halted=false → res=0), run_loop re-enters run(), and this thread
+            // burns 100% CPU spinning on BLOCKED — starving the handler thread.
             if (parent->protocol) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 cpu->jit->HaltExecution();
                 return 0xE320F000;
             }
@@ -213,7 +217,8 @@ public:
                     cpu->jit->HaltExecution();
                     return 0;
                 }
-                // If BLOCKED, don't busy-wait. Just halt and let the scheduler retry.
+                // If BLOCKED, sleep briefly to yield CPU to the handler thread.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
@@ -351,7 +356,8 @@ public:
                     cpu->jit->HaltExecution();
                     return;
                 }
-                // If BLOCKED, halt and let the scheduler retry.
+                // If BLOCKED, sleep briefly to yield CPU to the handler thread.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 cpu->jit->HaltExecution();
             }
             return;
