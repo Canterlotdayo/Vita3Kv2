@@ -18,6 +18,7 @@
 #include <module/module.h>
 #include <kernel/state.h>
 #include <kernel/thread/thread_state.h>
+#include <kernel/types.h>
 #include <util/log.h>
 
 #include <chrono>
@@ -820,8 +821,10 @@ EXPORT(int, pss_get_prng_provider) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, pss_get_thread_context) {
-    return UNIMPLEMENTED();
+EXPORT(int, pss_get_thread_context, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo) {
+    TRACY_FUNC(pss_get_thread_context, threadId, pCpuRegisterInfo);
+    Ptr<SceKernelThreadVfpRegisterInfo> nullVfp(0);
+    return CALL_EXPORT(_sceKernelGetThreadContextForVM, threadId, pCpuRegisterInfo, nullVfp);
 }
 
 EXPORT(int, pss_get_ticks_32) {
@@ -1024,12 +1027,15 @@ EXPORT(int, pss_prng_fill) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, pss_resume_thread) {
-    return UNIMPLEMENTED();
+EXPORT(int, pss_resume_thread, SceUID threadId) {
+    TRACY_FUNC(pss_resume_thread, threadId);
+    return CALL_EXPORT(sceKernelResumeThreadForVM, threadId);
 }
 
-EXPORT(int, pss_set_thread_context) {
-    return UNIMPLEMENTED();
+EXPORT(int, pss_set_thread_context, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo) {
+    TRACY_FUNC(pss_set_thread_context, threadId, pCpuRegisterInfo);
+    Ptr<SceKernelThreadVfpRegisterInfo> nullVfp(0);
+    return CALL_EXPORT(_sceKernelSetThreadContextForVM, threadId, pCpuRegisterInfo, nullVfp);
 }
 
 EXPORT(int, pss_set_win32_filetime) {
@@ -1045,8 +1051,9 @@ EXPORT(int, pss_supports_fast_tls) {
     return 0;
 }
 
-EXPORT(int, pss_suspend_thread) {
-    return UNIMPLEMENTED();
+EXPORT(int, pss_suspend_thread, SceUID threadId) {
+    TRACY_FUNC(pss_suspend_thread, threadId);
+    return CALL_EXPORT(sceKernelSuspendThreadForVM, threadId);
 }
 
 EXPORT(int, pss_threads_initialize) {

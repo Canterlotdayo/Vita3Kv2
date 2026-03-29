@@ -770,29 +770,6 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
 
-            // Patch the exception callback invoker stub at offset 0x19B700.
-            // mono-vita has ~159 internal fallback stubs ("mvn r0, #0; bx lr").
-            // Most should stay as-is (return -1 = non-zero = success flag).
-            // But the stub at 0x19B700 is the exception callback INVOKER:
-            // it receives a function pointer in r0 and should CALL it.
-            // The fallback stub returns -1 without calling → the exception
-            // callback never runs → mono_handle_exception never runs →
-            // NullReferenceException is never dispatched → infinite loop.
-            // Patch to: push {lr}; blx r0; pop {pc} (call r0 and return result).
-            {
-                Address code_start = segment_reloc_info[0].addr;
-                constexpr uint32_t CALLBACK_INVOKER_OFFSET = 0x199700;
-                Address stub_addr = code_start + CALLBACK_INVOKER_OFFSET;
-                uint32_t *stub = Ptr<uint32_t>(stub_addr).get(mem);
-                if (stub && stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E) {
-                    stub[0] = 0xE52DE004;  // push {lr}
-                    stub[1] = 0xE12FFF30;  // blx r0
-                    stub[2] = 0xE49DF004;  // pop {pc}
-                    LOG_INFO("Mono: patched exception callback invoker at 0x{:08X}", stub_addr);
-                    kernel.invalidate_jit_cache(stub_addr, 12);
-                }
-            }
-
         }
         if (segment_reloc_info.count(1)) {
             kernel.mono_data_start = segment_reloc_info[1].addr;
