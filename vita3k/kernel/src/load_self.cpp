@@ -832,15 +832,25 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
                             LOG_INFO("  stub at 0x{:08X} (offset 0x{:X})", code_start + off, off);
                         }
                     } else {
-                        LOG_WARN("Mono: callback invoker scan found 0 stubs (code=0x{:08X} size=0x{:X} nwords={})",
-                                 code_start, code_size, nwords);
-                        // Debug: check the exception handler location directly
-                        constexpr size_t EH_BLX_OFF = 0x15E4E0; // known offset of blx ip in exception handler
-                        if (EH_BLX_OFF / 4 < nwords) {
-                            LOG_WARN("  code[0x{:X}]=0x{:08X} (expect E12FFF3C blx ip)", EH_BLX_OFF, code[EH_BLX_OFF/4]);
-                            for (int d = -5; d <= 0; d++) {
-                                size_t idx = EH_BLX_OFF/4 + d;
-                                LOG_WARN("  code[0x{:X}]=0x{:08X}", idx*4, code[idx]);
+                        // Count blx ip and fallback stubs for debug
+                        size_t blx_total = 0;
+                        size_t stub_total = 0;
+                        size_t first_stub_off = 0;
+                        for (size_t k = 0; k < nwords; k++) {
+                            if (code[k] == 0xE12FFF3C) blx_total++;
+                            if (k + 1 < nwords && code[k] == 0xE3E00000 && code[k+1] == 0xE12FFF1E) {
+                                stub_total++;
+                                if (first_stub_off == 0) first_stub_off = k * 4;
+                            }
+                        }
+                        LOG_WARN("Mono: scan found 0 matches. blx_ip={} stubs={} first_stub=0x{:X}",
+                                 blx_total, stub_total, first_stub_off);
+                        // Dump first 4 stubs
+                        size_t dumped = 0;
+                        for (size_t k = 0; k + 1 < nwords && dumped < 4; k++) {
+                            if (code[k] == 0xE3E00000 && code[k+1] == 0xE12FFF1E) {
+                                LOG_WARN("  stub at offset 0x{:X} (addr 0x{:08X})", k*4, code_start + k*4);
+                                dumped++;
                             }
                         }
                     }
