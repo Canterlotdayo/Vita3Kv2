@@ -809,46 +809,6 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             }
             LOG_INFO("Mono: patched {} internal fallback stubs (return -1 → return 0)", patched);
 
-            // Patch the exception table search function (FUN_84DC94FC) to bypass
-            // pthread TLS lookup (NID 0x23D5CB94). Late-created Mono worker threads
-            // don't have their TLS set (GC_register_my_thread wasn't called for them),
-            // so the TLS lookup returns 0 → search fails → r0=0 → thread killed.
-            //
-            // The search function receives SceUID as r0, calls NID to convert it
-            // to a TLS key, then searches the exception table for that key.
-            // The exception table entries have SceUID in entry[0].
-            // By bypassing the TLS conversion and using SceUID directly,
-            // the search matches all registered threads.
-            //
-            // Pattern (unique, relocation-invariant):
-            //   E28D1000  add r1, sp, #0     ← output pointer
-            //   E12FFF3C  blx ip             ← call NID 0x23D5CB94
-            //   E3500000  cmp r0, #0         ← check result
-            //   1A00001C  bne error_path     ← branch if error
-            //
-            // Replace first 2 instructions with:
-            //   E58D0000  str r0, [sp]       ← store SceUID as search key
-            //   E3A00000  mov r0, #0         ← return success
-            {
-                uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
-                uint32_t code_words = code_size / 4;
-                bool tls_patched = false;
-                for (uint32_t i = 0; i + 3 < code_words; i++) {
-                    if (code[i]   == 0xE28D1000 &&  // add r1, sp, #0
-                        code[i+1] == 0xE12FFF3C &&  // blx ip
-                        code[i+2] == 0xE3500000 &&  // cmp r0, #0
-                        code[i+3] == 0x1A00001C) {  // bne +0x1C
-                        code[i]   = 0xE58D0000;     // str r0, [sp]
-                        code[i+1] = 0xE3A00000;     // mov r0, #0
-                        tls_patched = true;
-                        LOG_INFO("Mono: patched exception table TLS lookup at code+0x{:X}", i * 4);
-                        break;
-                    }
-                }
-                if (!tls_patched) {
-                    LOG_WARN("Mono: could not find exception table TLS lookup pattern to patch");
-                }
-            }
         }
         if (segment_reloc_info.count(1)) {
             kernel.mono_data_start = segment_reloc_info[1].addr;
