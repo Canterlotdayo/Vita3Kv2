@@ -769,9 +769,46 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             kernel.mono_code_end = segment_reloc_info[0].addr + segment_reloc_info[0].size;
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
-            // Note: mono-vita creates ~200 callback invoker stubs at runtime
-            // during module_start. These are patched lazily on first exception
-            // in signal_mono_exception (cpu_protocol.cpp).
+
+            // Fill the SceLibMonoBridge callback table before module_start.
+            // On real Vita, SceLibMonoBridge registers function pointers into a
+            // callback table exported by libc (NID 0x3CE6109D). mono-vita reads
+            // this table during module_start. If entries are NULL, it creates
+            // fallback stubs (return -1) that prevent exception callbacks from
+            // being invoked. Fill the table with a trampoline that calls the
+            // function pointer passed in r0 — this is the behavior of the
+            // callback invoker functions that SceLibMonoBridge provides.
+            {
+                constexpr uint32_t CALLBACK_TABLE_NID = 0x3CE6109D;
+                const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
+                auto it = kernel.export_nids.find(CALLBACK_TABLE_NID);
+                if (it != kernel.export_nids.end()) {
+                    Address table_addr = it->second;
+                    uint32_t *table = Ptr<uint32_t>(table_addr).get(mem);
+                    if (table) {
+                        // Allocate a small ARM trampoline in guest memory:
+                        // push {lr}; blx r0; pop {pc}
+                        Address trampoline = alloc(mem, 12, "MonoBridge_callback_trampoline");
+                        if (trampoline) {
+                            uint32_t *tramp = Ptr<uint32_t>(trampoline).get(mem);
+                            tramp[0] = 0xE52DE004; // push {lr}
+                            tramp[1] = 0xE12FFF30; // blx r0
+                            tramp[2] = 0xE49DF004; // pop {pc}
+
+                            // Fill NULL entries in the table. The table has up to 256 entries.
+                            int filled = 0;
+                            for (int i = 0; i < 256; i++) {
+                                if (table[i] == 0) {
+                                    table[i] = trampoline;
+                                    filled++;
+                                }
+                            }
+                            LOG_INFO("Mono: filled {} callback table entries with trampoline at 0x{:08X}",
+                                     filled, trampoline);
+                        }
+                    }
+                }
+            }
 
 
             kernel.mono_data_start = segment_reloc_info[1].addr;

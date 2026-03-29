@@ -99,54 +99,6 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
     if (kernel->mono_code_start == 0)
         return false;
 
-    // One-time: patch callback invoker stubs created by mono-vita's module_start.
-    // mono-vita creates ~200 fallback stubs ("mvn r0, #0; bx lr") at runtime for
-    // functions normally provided by SceLibMonoBridge. Some of these are callback
-    // INVOKERS that receive a function pointer in r0 and should CALL it. Without
-    // patching, the exception callback is never invoked.
-    // This must run AFTER module_start (the stubs don't exist at load time).
-    if (!kernel->mono_callback_invokers_patched) {
-        kernel->mono_callback_invokers_patched = true;
-        Address code_start = kernel->mono_code_start;
-        size_t code_size = kernel->mono_code_end - kernel->mono_code_start;
-        uint32_t *code = Ptr<uint32_t>(code_start).get(*mem);
-        if (code && code_size > 32) {
-            size_t nwords = code_size / 4;
-            int patched = 0;
-            for (size_t i = 8; i < nwords; i++) {
-                if (code[i] != 0xE12FFF3C) // blx ip
-                    continue;
-                uint32_t movw_val = 0, movt_val = 0;
-                bool found_ldr = false;
-                for (size_t j = (i >= 8 ? i - 8 : 0); j < i; j++) {
-                    uint32_t w = code[j];
-                    if ((w & 0xFFF0F000) == 0xE300C000)
-                        movw_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
-                    if ((w & 0xFFF0F000) == 0xE340C000)
-                        movt_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
-                    if ((w & 0xFFF0FFFF) == 0xE5900028)
-                        found_ldr = true;
-                }
-                if (!found_ldr || movw_val == 0 || movt_val == 0)
-                    continue;
-                uint32_t stub_addr = (movt_val << 16) | movw_val;
-                if (stub_addr < code_start || stub_addr >= code_start + code_size - 8)
-                    continue;
-                uint32_t stub_off = stub_addr - code_start;
-                uint32_t *stub = &code[stub_off / 4];
-                if (stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E) {
-                    stub[0] = 0xE52DE004; // push {lr}
-                    stub[1] = 0xE12FFF30; // blx r0
-                    stub[2] = 0xE49DF004; // pop {pc}
-                    kernel->invalidate_jit_cache(code_start + stub_off, 12);
-                    patched++;
-                }
-            }
-            if (patched > 0)
-                LOG_INFO("Mono: patched {} callback invoker stubs (lazy)", patched);
-        }
-    }
-
     // Don't signal for threads killed by double-fault (like real Vita)
     {
         std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
