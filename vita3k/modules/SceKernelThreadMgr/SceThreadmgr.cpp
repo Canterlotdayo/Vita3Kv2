@@ -688,15 +688,25 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
         old_ctx.cpsr = infoCpu->cpsr;
         load_context(*thread->cpu, old_ctx);
-
-        // Use write_pc to set the PC with proper ARM/Thumb interworking.
-        // Dynarmic's set_pc handles: bit 0 → Thumb mode, bit 1 → ARM alignment,
-        // and updates CPSR accordingly. load_context sets Regs[15] directly
-        // without this logic, which can leave the CPU in the wrong mode
-        // (e.g., Thumb mode at an ARM address → wrong instruction decoding).
         write_pc(*thread->cpu, new_pc);
-
         write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
+
+        // Diagnostic: when the trampoline PC is set, dump the stack
+        // that the trampoline will pop from.
+        uint32_t new_sp = infoCpu->reg[13];
+        if (new_pc >= emuenv.kernel.mono_code_start && new_pc < emuenv.kernel.mono_code_end) {
+            // Trampoline: add sp, 0x94; pop {r4-r8,sb,pc}
+            // Pop reads 7 words from new_sp + 0x94
+            uint32_t pop_addr = new_sp + 0x94;
+            Ptr<uint32_t> pop_ptr(pop_addr);
+            if (pop_ptr.valid(emuenv.mem)) {
+                uint32_t *stk = pop_ptr.get(emuenv.mem);
+                LOG_WARN("SetCtx trampoline: thread {} PC=0x{:08X} SP=0x{:08X} r9=0x{:08X}",
+                         threadId, new_pc, new_sp, infoCpu->reg[9]);
+                LOG_WARN("  stack@0x{:08X}: r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} sb={:08X} PC={:08X}",
+                         pop_addr, stk[0], stk[1], stk[2], stk[3], stk[4], stk[5], stk[6]);
+            }
+        }
     }
 
     SceKernelThreadVfpRegisterInfo *infoVfp = pVfpRegisterInfo.get(emuenv.mem);
