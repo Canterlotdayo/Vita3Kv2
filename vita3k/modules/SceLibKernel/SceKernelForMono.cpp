@@ -103,91 +103,14 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     }
 
     // Write exception info into the output structure.
-    // The structure layout (from Ghidra disassembly):
-    //   +0x00: size (set by caller to 0x18 = 24 bytes)
-    //   +0x04: faulting thread ID (SceUID — the callback converts to pthread_t
-    //          via pthread_getspecific_for_thread before searching the table)
-    //   +0x08: fault address
-    //   +0x0C: fault PC
-    //   +0x10: exception type
-    //   +0x14: reserved
     if (pInfo) {
         uint32_t *info = pInfo.get(emuenv.mem);
+        // info[0] = size, already set by caller (0x18)
         info[1] = static_cast<uint32_t>(faulting_tid);  // SceUID
         info[2] = fault_addr;
         info[3] = fault_pc;
-        info[4] = 0x101;
+        info[4] = 0x101;  // exception type
         info[5] = 0;
-    }
-
-    // Get the faulting thread's pthread_t from its name (hex prefix like "8BF2E610 Mono").
-    // Exception table entries use pthread_t (the callback converts SceUID→pthread_t
-    // via NID 0x23D5CB94 before searching).
-    uint32_t pthread_id = static_cast<uint32_t>(faulting_tid); // fallback
-    if (faulting_thread) {
-        const std::string &tname = faulting_thread->name;
-        if (!tname.empty()) {
-            char *end = nullptr;
-            unsigned long parsed = strtoul(tname.c_str(), &end, 16);
-            if (end != tname.c_str() && *end == ' ' && parsed > 0x80000000) {
-                pthread_id = static_cast<uint32_t>(parsed);
-            }
-        }
-    }
-
-    // Diagnostic: dump exception table AND libc callback tables
-    if (emuenv.kernel.mono_data_start != 0) {
-        constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
-        constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
-
-        Address table_addr = emuenv.kernel.mono_data_start + EXCEPTION_TABLE_OFFSET;
-        Address counter_addr = emuenv.kernel.mono_data_start + EXCEPTION_COUNTER_OFFSET;
-        uint32_t *counter = Ptr<uint32_t>(counter_addr).get(emuenv.mem);
-        uint32_t count = *counter;
-
-        // Check if faulting thread is in the table
-        bool found = false;
-        if (count < 256) {
-            uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
-            for (uint32_t i = 0; i < count; i++) {
-                if (table[i]) {
-                    uint32_t *entry = Ptr<uint32_t>(table[i]).get(emuenv.mem);
-                    if (entry && entry[0] == static_cast<uint32_t>(faulting_tid)) {
-                        found = true;
-                        LOG_WARN("Exception table: faulting thread {} FOUND at idx={}", faulting_tid, i);
-                        break;
-                    }
-                }
-            }
-        }
-        if (!found) {
-            LOG_WARN("Exception table: faulting thread {} NOT FOUND in {} entries", faulting_tid, count);
-        }
-
-        // Dump libc callback tables via mono-vita import entries.
-        // These are at fixed offsets from mono code segment start.
-        // The import entry contains a pointer to the libc variable.
-        Address code_start = emuenv.kernel.mono_code_start;
-        if (code_start) {
-            // Offsets of variable import entries in code segment (from ELF analysis)
-            constexpr uint32_t VAR_IMPORT_OFFSETS[] = { 0x1A0A7C, 0x1A0948, 0x1A0BD0 };
-            const char *VAR_NAMES[] = { "0x3CE6109D", "0x5D8C1282", "0xD662E07C" };
-            for (int v = 0; v < 3; v++) {
-                Address entry_addr = code_start + VAR_IMPORT_OFFSETS[v];
-                Ptr<uint32_t> entry_ptr(entry_addr);
-                if (entry_ptr.valid(emuenv.mem)) {
-                    Address libc_addr = *entry_ptr.get(emuenv.mem);
-                    LOG_WARN("Callback table NID {} → entry@0x{:08X} → libc@0x{:08X}", VAR_NAMES[v], entry_addr, libc_addr);
-                    if (libc_addr && libc_addr != 0xDEADBEEF) {
-                        Ptr<uint32_t> tbl(libc_addr);
-                        if (tbl.valid(emuenv.mem)) {
-                            uint32_t *t = tbl.get(emuenv.mem);
-                            LOG_WARN("  contents: [{:08X}] [{:08X}] [{:08X}] [{:08X}]", t[0], t[1], t[2], t[3]);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     LOG_WARN("sceKernelWaitExceptionForMono: woke up! Faulting thread ID: {}, addr: 0x{:08X}, PC: 0x{:08X}",
