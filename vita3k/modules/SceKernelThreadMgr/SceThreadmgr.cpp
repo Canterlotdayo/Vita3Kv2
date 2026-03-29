@@ -683,33 +683,20 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
             return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
 
         CPUContext old_ctx = save_context(*thread->cpu);
-        uint32_t old_pc = old_ctx.cpu_registers[15];
         uint32_t new_pc = infoCpu->reg[15];
 
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
         old_ctx.cpsr = infoCpu->cpsr;
-
-        // Fix ARM/Thumb mode based on PC bit 0 (ARM interworking convention).
-        // On real Vita, the kernel sets the Thumb bit in CPSR from PC bit 0.
-        // PC bit 0 = 1 → Thumb mode; PC bit 0 = 0 → ARM mode.
-        // Without this, setting PC to ARM code (like Mono's exception trampoline
-        // at 0x84D652E8) while CPSR has Thumb set (from JIT code) causes the
-        // thread to decode ARM instructions as Thumb → crash.
-        if (new_pc & 1) {
-            old_ctx.cpsr |= 0x20;          // Set Thumb bit
-            old_ctx.cpu_registers[15] &= ~1u; // Clear bit 0 of PC
-        } else {
-            old_ctx.cpsr &= ~0x20u;        // Clear Thumb bit (ARM mode)
-        }
-
         load_context(*thread->cpu, old_ctx);
-        write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
 
-        // Invalidate JIT cache at the new PC. Dynarmic caches compiled blocks
-        // by address. If the block was previously compiled in a different mode
-        // (Thumb vs ARM), the cached block decodes instructions incorrectly.
-        // Force recompilation with the correct CPSR Thumb bit.
-        invalidate_jit_cache(*thread->cpu, old_ctx.cpu_registers[15], 4);
+        // Use write_pc to set the PC with proper ARM/Thumb interworking.
+        // Dynarmic's set_pc handles: bit 0 → Thumb mode, bit 1 → ARM alignment,
+        // and updates CPSR accordingly. load_context sets Regs[15] directly
+        // without this logic, which can leave the CPU in the wrong mode
+        // (e.g., Thumb mode at an ARM address → wrong instruction decoding).
+        write_pc(*thread->cpu, new_pc);
+
+        write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
     }
 
     SceKernelThreadVfpRegisterInfo *infoVfp = pVfpRegisterInfo.get(emuenv.mem);
