@@ -46,8 +46,8 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
     return CALL_EXPORT(sceKernelSuspendThreadForVM, threadId);
 }
 
-EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int flags) {
-    TRACY_FUNC(sceKernelWaitExceptionForMono, type, pInfo, flags);
+EXPORT(int, sceKernelWaitExceptionForMono, Ptr<uint32_t> pInfo, int type, int flags) {
+    TRACY_FUNC(sceKernelWaitExceptionForMono, pInfo, type, flags);
 
     LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
 
@@ -164,7 +164,7 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, sceKernelWaitExceptionCBForMono, int type, Ptr<uint32_t> pInfo, int flags) {
-    TRACY_FUNC(sceKernelWaitExceptionCBForMono, type, pInfo, flags);
-    return CALL_EXPORT(sceKernelWaitExceptionForMono, type, pInfo, flags);
+EXPORT(int, sceKernelWaitExceptionCBForMono, Ptr<uint32_t> pInfo, int type, int flags) {
+    TRACY_FUNC(sceKernelWaitExceptionCBForMono, pInfo, type, flags);
+    return CALL_EXPORT(sceKernelWaitExceptionForMono, pInfo, type, flags);
 }
