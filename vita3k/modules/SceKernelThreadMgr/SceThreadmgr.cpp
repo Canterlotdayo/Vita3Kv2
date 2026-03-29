@@ -688,36 +688,6 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
                  threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
 
-        // When the Mono exception callback can't find the faulting thread in the
-        // GC critical section table (FUN_84dc95bc returns NULL → r0=0), the thread
-        // cannot be recovered. On real Vita, the callback crashes on str r0,[NULL],
-        // the kernel catches this double-fault, kills the ExceptionHandlerThread,
-        // and the faulting thread stays suspended forever. The game handles missing
-        // workers via timeouts.
-        //
-        // In Vita3K: don't apply the callback's broken context to the faulting thread.
-        // Don't resume it. Add it to dead_threads so it's never re-signaled.
-        // The ExceptionHandlerThread continues normally to its wait loop.
-        bool is_mono_exception_context = (emuenv.kernel.mono_exception_handler_thread != 0 &&
-                                          new_pc >= emuenv.kernel.mono_code_start &&
-                                          new_pc < emuenv.kernel.mono_code_end);
-
-        if (infoCpu->reg[0] == 0 && is_mono_exception_context) {
-            LOG_WARN("  SetCtx: Mono exception r0=0 for thread {} — leaving thread suspended (like real Vita double-fault)",
-                     threadId);
-
-            // Don't apply the callback's context — leave faulting thread as-is (suspended)
-            // Set skip_resume so ResumeThreadForMono won't resume it
-            emuenv.kernel.mono_exception_skip_resume = true;
-
-            // Add to dead_threads so signal_mono_exception ignores future faults
-            {
-                std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
-                emuenv.kernel.mono_exception_dead_threads.insert(threadId);
-            }
-            return SCE_KERNEL_OK; // Return WITHOUT applying context
-        }
-
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
         old_ctx.cpsr = infoCpu->cpsr;
         load_context(*thread->cpu, old_ctx);

@@ -33,16 +33,6 @@ EXPORT(int, sceKernelGetThreadContextForMono, SceUID threadId, Ptr<SceKernelThre
 
 EXPORT(int, sceKernelResumeThreadForMono, SceUID threadId) {
     TRACY_FUNC(sceKernelResumeThreadForMono, threadId);
-
-    // If the exception callback failed (r0=0), don't resume the faulting thread.
-    // On real Vita, the double-fault kills the thread. We emulate this by
-    // leaving it suspended forever.
-    if (emuenv.kernel.mono_exception_skip_resume) {
-        LOG_WARN("sceKernelResumeThreadForMono: NOT resuming thread {} (dead by double-fault)", threadId);
-        emuenv.kernel.mono_exception_skip_resume = false;
-        return SCE_KERNEL_OK;
-    }
-
     return CALL_EXPORT(sceKernelResumeThreadForVM, threadId);
 }
 
