@@ -98,8 +98,8 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
 
     tls_array[TLS_PROCESS_ID] = 1; // stubbed. unused
     tls_array[TLS_THREAD_ID] = id;
-    tls_array[TLS_SP_TOP] = stack.get();
-    tls_array[TLS_SP_BOTTOM] = stack.get() + stack_size;
+    tls_array[TLS_SP_TOP] = stack.get() + stack_size; // highest address (initial SP)
+    tls_array[TLS_SP_BOTTOM] = stack.get();            // lowest address (stack base)
     tls_array[TLS_CURRENT_PRIORITY] = priority;
     tls_array[TLS_CPU_AFFINITY_MASK] = affinity_mask;
 
