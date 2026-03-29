@@ -770,44 +770,14 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
 
-            // Patch mono-vita's internal fallback stubs.
-            // mono-vita has ~159 functions compiled as "mvn r0, #0; bx lr" (return -1).
-            // These are fallbacks for functions normally provided by SceLibMonoBridge
-            // on real Vita. Returning -1 is wrong: getenv(-1) is treated as a non-null
-            // pointer, causing the debugger init to parse garbage → interpreter called
-            // with corrupted IL pointer (sl=1) → writes to invalid addresses → cascade.
-            // Patch to "mov r0, #0; bx lr" (return 0/NULL) which is correct:
-            // getenv returns NULL (no env vars on Vita), other functions return 0 (no-op).
-            Address code_start = segment_reloc_info[0].addr;
-            size_t code_size = segment_reloc_info[0].size;
-            uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
-            int patched = 0;
-            if (code) {
-                LOG_INFO("Mono stub scan: code_start=0x{:08X} code_size=0x{:X} first_word=0x{:08X}",
-                         code_start, code_size, code[0]);
-
-                // Debug: check what's at the expected stub area (~offset 0x199000 from base)
-                // This is where stubs live in the known ELF. Log a few words to see if
-                // relocations changed them.
-                size_t stub_area_offset = 0x199000 / 4; // word index
-                if (stub_area_offset + 20 < code_size / 4) {
-                    LOG_INFO("Mono stub debug: words at offset 0x199000 (expected stub area):");
-                    for (int j = 0; j < 16; j++) {
-                        LOG_INFO("  [+0x{:X}] = 0x{:08X}", (stub_area_offset + j) * 4, code[stub_area_offset + j]);
-                    }
-                }
-
-                for (size_t i = 0; i < code_size / 4 - 1; i++) {
-                    // Pattern: mvn r0, #0 (0xE3E00000) followed by bx lr (0xE12FFF1E)
-                    if (code[i] == 0xE3E00000 && code[i + 1] == 0xE12FFF1E) {
-                        code[i] = 0xE3A00000; // mov r0, #0
-                        patched++;
-                    }
-                }
-            } else {
-                LOG_ERROR("Mono stub scan: code pointer is NULL for address 0x{:08X}", code_start);
-            }
-            LOG_INFO("Mono: patched {} internal fallback stubs (return -1 → return 0)", patched);
+            // Note: mono-vita has ~159 internal fallback stubs compiled as
+            // "mvn r0, #0; bx lr" (return -1). These are fallbacks for functions
+            // normally provided by SceLibMonoBridge. We do NOT patch these to
+            // return 0 because many of them are used as "non-zero = success"
+            // flags. In particular, the exception handler dispatch function at
+            // ~offset 0x199700 returns -1 to indicate "callback ready". Changing
+            // it to 0 prevents the exception callback from being called, which
+            // breaks Mono NullReferenceException handling entirely.
 
         }
         if (segment_reloc_info.count(1)) {
