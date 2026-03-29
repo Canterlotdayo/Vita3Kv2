@@ -139,8 +139,22 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
         const ExportNids::iterator export_address = kernel.export_nids.find(nid);
         uint32_t *const stub = entry.get(mem);
 
+        // On real Vita, import stubs are placed in a separate area by the loader.
+        // In Vita3K, they go at the ELF-specified addresses, which can overlap
+        // with internal functions (e.g. mono-vita's callback invokers).
+        // Only write the import stub if the address contains the default
+        // fallback pattern (mvn r0,#0; bx lr) — the compiled-in placeholder
+        // that the linker is meant to replace. If it contains other code
+        // (an internal function), don't overwrite it.
+        bool is_default_stub = (stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E);
+        // Also treat zero-filled memory as writable (freshly allocated)
+        bool is_empty = (stub[0] == 0 && stub[1] == 0);
+
         kernel.func_binding_infos.emplace(nid, entry.address());
-        if (export_address == kernel.export_nids.end()) {
+        if (!is_default_stub && !is_empty) {
+            // Address has real code — don't overwrite. The variable
+            // relocations (reftable at stub[3]) still need processing.
+        } else if (export_address == kernel.export_nids.end()) {
             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
             stub[2] = nid; // Our interrupt hook will read this.

@@ -100,41 +100,6 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
     if (kernel->mono_code_start == 0)
         return false;
 
-    // One-time: restore mono-vita's import stubs.
-    // mono-vita's runtime init overwrites resolved import stubs with fallback
-    // code (mvn r0, #0; bx lr). On real Vita, these stubs are protected.
-    // Restore them so kernel functions (SetContext, GetContext, etc.) work.
-    if (!kernel->mono_callback_invokers_patched) {
-        kernel->mono_callback_invokers_patched = true;
-        Address code_start = kernel->mono_code_start;
-        Address code_end = kernel->mono_code_end;
-        const std::lock_guard<std::mutex> guard(kernel->export_nids_mutex);
-        int restored = 0;
-        for (const auto &[nid, stub_addr] : kernel->func_binding_infos) {
-            if (stub_addr < code_start || stub_addr >= code_end)
-                continue;
-            uint32_t *stub = Ptr<uint32_t>(stub_addr).get(*mem);
-            if (!stub) continue;
-            if (stub[0] != 0xE3E00000 || stub[1] != 0xE12FFF1E)
-                continue;
-            auto export_it = kernel->export_nids.find(nid);
-            if (export_it != kernel->export_nids.end()) {
-                Address func_address = export_it->second;
-                stub[0] = encode_arm_inst(INSTRUCTION_MOVW, (uint16_t)func_address, 12);
-                stub[1] = encode_arm_inst(INSTRUCTION_MOVT, (uint16_t)(func_address >> 16), 12);
-                stub[2] = encode_arm_inst(INSTRUCTION_BRANCH, 0, 12);
-            } else {
-                stub[0] = 0xEF000000;
-                stub[1] = 0xE1A0F00E;
-                stub[2] = nid;
-            }
-            kernel->invalidate_jit_cache(stub_addr, 12);
-            restored++;
-        }
-        if (restored > 0)
-            LOG_INFO("Mono: restored {} import stubs at first exception", restored);
-    }
-
     // Don't signal for threads killed by double-fault (like real Vita)
     {
         std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
