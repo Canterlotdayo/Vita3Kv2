@@ -789,6 +789,7 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
 
                 if (code && code_size > 32) {
                     size_t nwords = code_size / 4;
+                    size_t blx_count = 0;
                     for (size_t i = 8; i < nwords; i++) {
                         // Find blx ip (E12FFF3C)
                         if (code[i] != 0xE12FFF3C)
@@ -829,6 +830,18 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
                         LOG_INFO("Mono: patched {} callback invoker stubs", patched_offsets.size());
                         for (auto off : patched_offsets) {
                             LOG_INFO("  stub at 0x{:08X} (offset 0x{:X})", code_start + off, off);
+                        }
+                    } else {
+                        LOG_WARN("Mono: callback invoker scan found 0 stubs (code=0x{:08X} size=0x{:X} nwords={})",
+                                 code_start, code_size, nwords);
+                        // Debug: check the exception handler location directly
+                        constexpr size_t EH_BLX_OFF = 0x15E4E0; // known offset of blx ip in exception handler
+                        if (EH_BLX_OFF / 4 < nwords) {
+                            LOG_WARN("  code[0x{:X}]=0x{:08X} (expect E12FFF3C blx ip)", EH_BLX_OFF, code[EH_BLX_OFF/4]);
+                            for (int d = -5; d <= 0; d++) {
+                                size_t idx = EH_BLX_OFF/4 + d;
+                                LOG_WARN("  code[0x{:X}]=0x{:08X}", idx*4, code[idx]);
+                            }
                         }
                     }
                 }
