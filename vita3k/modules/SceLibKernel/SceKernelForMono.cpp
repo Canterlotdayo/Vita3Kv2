@@ -111,20 +111,20 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     }
 
     // Write exception info into the output structure.
-    // Layout matches the real Vita kernel's SCE exception info struct:
+    // Layout as expected by Unity's mono-vita exception handler:
     //   +0x00 (info[0]): size (0x18, already set by caller)
-    //   +0x04 (info[1]): exception type (0x10=prefetch abort, 0x20=data abort)
-    //   +0x08 (info[2]): faulting thread SceUID
-    //   +0x0C (info[3]): fault address
-    //   +0x10 (info[4]): program counter at fault
+    //   +0x04 (info[1]): faulting thread SceUID
+    //   +0x08 (info[2]): fault address
+    //   +0x0C (info[3]): fault PC (program counter at fault instruction)
+    //   +0x10 (info[4]): exception type (0x10=prefetch abort, 0x20=data abort)
     //   +0x14 (info[5]): DFSR/IFSR status register (0)
     if (pInfo) {
         uint32_t *info = pInfo.get(emuenv.mem);
         // info[0] = size, already set by caller (0x18)
-        info[1] = is_prefetch ? 0x10 : 0x20;               // exception type
-        info[2] = static_cast<uint32_t>(faulting_tid);      // faulting thread ID
-        info[3] = fault_addr;                               // fault address
-        info[4] = fault_pc;                                 // PC at fault
+        info[1] = static_cast<uint32_t>(faulting_tid);      // faulting thread ID
+        info[2] = fault_addr;                               // fault address
+        info[3] = fault_pc;                                 // PC at fault
+        info[4] = is_prefetch ? 0x10 : 0x20;               // exception type
         info[5] = 0;                                        // DFSR/IFSR (not emulated)
     }
 
