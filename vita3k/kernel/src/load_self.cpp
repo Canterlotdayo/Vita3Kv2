@@ -771,16 +771,16 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
             // Patch mono-vita's internal callback invoker stubs.
-            // mono-vita has ~159 internal fallback stubs ("mvn r0, #0; bx lr").
-            // Some of these are callback INVOKERS: they receive a function pointer
-            // in r0 and should CALL it. On real Vita, SceLibMonoBridge provides
-            // the real implementations. In Vita3K, the stubs return -1 without
-            // calling → callbacks (including the exception handler) never run.
+            // mono-vita has ~200 internal fallback stubs ("mvn r0, #0; bx lr").
+            // Some are callback INVOKERS: called with a function pointer in r0
+            // (loaded from [rN+0x28]) and should CALL it. The stubs return -1
+            // without calling → callbacks (including exception handler) never run.
             //
-            // Dynamically find callback invoker stubs by scanning for the caller
-            // pattern: "ldr r0, [rN, #0x28]" (load callback ptr) followed by
-            // "blx ip" where ip targets a fallback stub. Patch each matching
-            // stub to: push {lr}; blx r0; pop {pc} (call the function pointer).
+            // Find these by scanning for "blx ip" where ip targets a fallback
+            // stub, and the preceding instructions include both:
+            //   movw/movt ip (loading the stub address)
+            //   ldr r0, [rN, #0x28] (loading the callback pointer)
+            // The compiler may interleave these in any order.
             {
                 Address code_start = segment_reloc_info[0].addr;
                 size_t code_size = segment_reloc_info[0].size;
@@ -788,34 +788,33 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
                 std::set<uint32_t> patched_offsets;
 
                 if (code && code_size > 32) {
-                    for (size_t i = 0; i < code_size / 4 - 8; i++) {
-                        // Match: ldr r0, [rN, #0x28] = E59X0028 where X = 0-F
-                        if ((code[i] & 0xFFF0FFFF) != 0xE5900028)
+                    size_t nwords = code_size / 4;
+                    for (size_t i = 8; i < nwords; i++) {
+                        // Find blx ip (E12FFF3C)
+                        if (code[i] != 0xE12FFF3C)
                             continue;
 
-                        // Search forward (within 8 instructions) for movw ip + movt ip + blx ip
+                        // Search backward (up to 8 instructions) for movw ip, movt ip, ldr r0,[rN,#0x28]
                         uint32_t movw_val = 0, movt_val = 0;
-                        bool found_blx = false;
-                        for (size_t j = i + 1; j < i + 8 && j < code_size / 4; j++) {
+                        bool found_ldr = false;
+                        for (size_t j = (i >= 8 ? i - 8 : 0); j < i; j++) {
                             uint32_t w = code[j];
                             if ((w & 0xFFF0F000) == 0xE300C000) // movw ip, #imm
                                 movw_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
-                            else if ((w & 0xFFF0F000) == 0xE340C000) // movt ip, #imm
+                            if ((w & 0xFFF0F000) == 0xE340C000) // movt ip, #imm
                                 movt_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
-                            else if (w == 0xE12FFF3C) { // blx ip
-                                found_blx = true;
-                                break;
-                            }
+                            if ((w & 0xFFF0FFFF) == 0xE5900028) // ldr r0, [rN, #0x28]
+                                found_ldr = true;
                         }
 
-                        if (!found_blx || movw_val == 0)
+                        if (!found_ldr || movw_val == 0 || movt_val == 0)
                             continue;
 
                         uint32_t stub_addr = (movt_val << 16) | movw_val;
-                        uint32_t stub_off = stub_addr - code_start;
-                        if (stub_off >= code_size - 8)
+                        if (stub_addr < code_start || stub_addr >= code_start + code_size - 8)
                             continue;
 
+                        uint32_t stub_off = stub_addr - code_start;
                         uint32_t *stub = &code[stub_off / 4];
                         if (stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E) {
                             if (patched_offsets.insert(stub_off).second) {
