@@ -687,6 +687,8 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         uint32_t new_pc = infoCpu->reg[15];
         LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
                  threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
+        LOG_WARN("  SetCtx regs: r0={:08X} r9={:08X} SP={:08X} tpidrurw={:08X}",
+                 infoCpu->reg[0], infoCpu->reg[9], infoCpu->reg[13], infoCpu->tpidrurw);
 
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
         old_ctx.cpsr = infoCpu->cpsr;
