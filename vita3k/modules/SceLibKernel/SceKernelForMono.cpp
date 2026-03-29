@@ -51,8 +51,28 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
 
     LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
 
+    // Check if the PREVIOUS faulting thread is still suspended.
+    // If so, Mono's callback didn't handle the exception (no SetContext/Resume).
+    // On real Vita, an unhandled exception terminates the thread.
+    // Here, we resume the thread so it returns from the null call with r0=0
+    // (the NOP fallback from MemoryReadCode). This prevents the thread from
+    // being suspended forever and causing a deadlock.
     {
         std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+        SceUID prev_tid = emuenv.kernel.mono_exception_thread_id;
+        if (prev_tid != 0) {
+            auto prev_thread = emuenv.kernel.get_thread(prev_tid);
+            if (prev_thread) {
+                std::lock_guard<std::mutex> tlock(prev_thread->mutex);
+                if (prev_thread->status == ThreadStatus::suspend) {
+                    LOG_WARN("WaitExceptionForMono: previous faulting thread {} still suspended — forcing resume (unhandled exception)", prev_tid);
+                    prev_thread->to_do = ThreadToDo::run;
+                    prev_thread->something_to_do.notify_one();
+                }
+            }
+            emuenv.kernel.mono_exception_thread_id = 0;
+        }
+
         emuenv.kernel.mono_exception_handler_thread = thread_id;
 
         if (emuenv.kernel.mono_exception_sema == 0) {
