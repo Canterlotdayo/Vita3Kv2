@@ -27,7 +27,6 @@
 #include <util/log.h>
 
 #include <util/elf.h>
-#include <set>
 // clang-format off
 #define SCE_ELF_DEFS_TARGET
 #include <sce-elf-defs.h>
@@ -770,92 +769,9 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             kernel.mono_code_end = segment_reloc_info[0].addr + segment_reloc_info[0].size;
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
-            // Patch mono-vita's internal callback invoker stubs.
-            // mono-vita has ~200 internal fallback stubs ("mvn r0, #0; bx lr").
-            // Some are callback INVOKERS: called with a function pointer in r0
-            // (loaded from [rN+0x28]) and should CALL it. The stubs return -1
-            // without calling → callbacks (including exception handler) never run.
-            //
-            // Find these by scanning for "blx ip" where ip targets a fallback
-            // stub, and the preceding instructions include both:
-            //   movw/movt ip (loading the stub address)
-            //   ldr r0, [rN, #0x28] (loading the callback pointer)
-            // The compiler may interleave these in any order.
-            {
-                Address code_start = segment_reloc_info[0].addr;
-                size_t code_size = segment_reloc_info[0].size;
-                uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
-                std::set<uint32_t> patched_offsets;
-
-                if (code && code_size > 32) {
-                    size_t nwords = code_size / 4;
-                    size_t blx_count = 0;
-                    for (size_t i = 8; i < nwords; i++) {
-                        // Find blx ip (E12FFF3C)
-                        if (code[i] != 0xE12FFF3C)
-                            continue;
-
-                        // Search backward (up to 8 instructions) for movw ip, movt ip, ldr r0,[rN,#0x28]
-                        uint32_t movw_val = 0, movt_val = 0;
-                        bool found_ldr = false;
-                        for (size_t j = (i >= 8 ? i - 8 : 0); j < i; j++) {
-                            uint32_t w = code[j];
-                            if ((w & 0xFFF0F000) == 0xE300C000) // movw ip, #imm
-                                movw_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
-                            if ((w & 0xFFF0F000) == 0xE340C000) // movt ip, #imm
-                                movt_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
-                            if ((w & 0xFFF0FFFF) == 0xE5900028) // ldr r0, [rN, #0x28]
-                                found_ldr = true;
-                        }
-
-                        if (!found_ldr || movw_val == 0 || movt_val == 0)
-                            continue;
-
-                        uint32_t stub_addr = (movt_val << 16) | movw_val;
-                        if (stub_addr < code_start || stub_addr >= code_start + code_size - 8)
-                            continue;
-
-                        uint32_t stub_off = stub_addr - code_start;
-                        uint32_t *stub = &code[stub_off / 4];
-                        if (stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E) {
-                            if (patched_offsets.insert(stub_off).second) {
-                                stub[0] = 0xE52DE004; // push {lr}
-                                stub[1] = 0xE12FFF30; // blx r0
-                                stub[2] = 0xE49DF004; // pop {pc}
-                                kernel.invalidate_jit_cache(code_start + stub_off, 12);
-                            }
-                        }
-                    }
-                    if (!patched_offsets.empty()) {
-                        LOG_INFO("Mono: patched {} callback invoker stubs", patched_offsets.size());
-                        for (auto off : patched_offsets) {
-                            LOG_INFO("  stub at 0x{:08X} (offset 0x{:X})", code_start + off, off);
-                        }
-                    } else {
-                        // Count blx ip and fallback stubs for debug
-                        size_t blx_total = 0;
-                        size_t stub_total = 0;
-                        size_t first_stub_off = 0;
-                        for (size_t k = 0; k < nwords; k++) {
-                            if (code[k] == 0xE12FFF3C) blx_total++;
-                            if (k + 1 < nwords && code[k] == 0xE3E00000 && code[k+1] == 0xE12FFF1E) {
-                                stub_total++;
-                                if (first_stub_off == 0) first_stub_off = k * 4;
-                            }
-                        }
-                        LOG_WARN("Mono: scan found 0 matches. blx_ip={} stubs={} first_stub=0x{:X}",
-                                 blx_total, stub_total, first_stub_off);
-                        // Dump first 4 stubs
-                        size_t dumped = 0;
-                        for (size_t k = 0; k + 1 < nwords && dumped < 4; k++) {
-                            if (code[k] == 0xE3E00000 && code[k+1] == 0xE12FFF1E) {
-                                LOG_WARN("  stub at offset 0x{:X} (addr 0x{:08X})", k*4, code_start + k*4);
-                                dumped++;
-                            }
-                        }
-                    }
-                }
-            }
+            // Note: mono-vita creates ~200 callback invoker stubs at runtime
+            // during module_start. These are patched lazily on first exception
+            // in signal_mono_exception (cpu_protocol.cpp).
 
 
             kernel.mono_data_start = segment_reloc_info[1].addr;
