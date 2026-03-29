@@ -437,16 +437,21 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
-    // For the Mono faulting thread, use the saved context from the moment of
-    // the fault. After signal_mono_exception, the thread continues executing
-    // in the JIT block (NOPs, zero reads) which corrupts ALL registers.
-    // On the real Vita, GetContext returns the state AT the fault instruction.
+    // For the Mono faulting thread, use the saved context that was captured
+    // by WaitExceptionForMono AFTER Dynarmic's run() returned. At that point
+    // all guest registers have been committed to JitState and save_context()
+    // returns accurate r0-r14 values. PC is overridden with fault_pc.
+    //
+    // Previously, the context was saved during the MemoryRead callback while
+    // Dynarmic was still executing a basic block, causing stale register values
+    // (especially r9, the base register for many null-dereference faults).
     CPUContext context;
     bool using_saved = false;
     {
         std::lock_guard<std::mutex> mlock(emuenv.kernel.mono_exception_mutex);
-        if (emuenv.kernel.mono_exception_thread_id == threadId && emuenv.kernel.mono_exception_pending == false) {
-            // pending was cleared by WaitExceptionForMono — this is the handler reading context
+        if (emuenv.kernel.mono_exception_thread_id == threadId && emuenv.kernel.mono_exception_pending == false
+            && emuenv.kernel.mono_exception_saved_context.cpu_registers[15] != 0) {
+            // Use the context saved by WaitExceptionForMono after the thread suspended
             context = emuenv.kernel.mono_exception_saved_context;
             using_saved = true;
             LOG_WARN("GetThreadContextForVM: using SAVED context for faulting thread {} (PC=0x{:08X})",

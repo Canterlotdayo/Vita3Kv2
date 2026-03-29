@@ -134,23 +134,12 @@ public:
             }
 
             // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // DON'T fall through to the NOP fallback — that corrupts the thread.
-            // On real Vita, each thread's exception is handled independently.
-            // We must wait for the pending exception to be processed, then retry.
+            // halt and return NOP. Don't busy-wait — that deadlocks because the
+            // handler thread needs CPU time to process the pending exception.
+            // The thread will be re-run after the pending exception is handled.
             if (parent->protocol) {
-                int wait_count = 0;
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
-                        mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return 0xE320F000;
-                    }
-                    if (++wait_count > 100000) { // 10 second timeout
-                        LOG_ERROR("Mono exception signal timeout for thread {} — falling through", parent->thread_id);
-                        break;
-                    }
-                }
+                cpu->jit->HaltExecution();
+                return 0xE320F000;
             }
 
             // Fallback for non-Mono games or when handler isn't ready:
@@ -182,7 +171,6 @@ public:
     // Prevents the fallback path from redirecting PC on subsequent
     // MemoryReadCode callbacks in the same basic block.
     bool mono_exception_signaled = false;
-    int mono_suspend_read_count = 0;
 
     static void TraceInstruction(uint64_t self_, uint64_t address, uint64_t is_thumb) {
         ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
@@ -206,64 +194,39 @@ public:
     T MemoryRead(Dynarmic::A32::VAddr addr) {
         Ptr<T> ptr{ addr };
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
-            // If a Mono exception was already signaled, count invalid reads.
-            // After the first exception is handled and the thread resumes,
-            // it may re-fault. The flag stays true from the JIT block finishing.
-            // After enough invalid reads, reset and try to signal again.
+            // If a Mono exception was already signaled in this run() call,
+            // just return 0 for all subsequent invalid reads in this basic block.
+            // Do NOT re-signal — that caused an infinite fault loop because:
+            // 1) save_context() during MemoryRead returns stale registers
+            // 2) Mono receives wrong context → sets wrong recovery PC
+            // 3) Thread re-faults immediately → cycle repeats forever
+            // The thread will be suspended after HaltExecution takes effect
+            // and run() returns with committed register state.
             if (mono_exception_signaled) {
-                mono_suspend_read_count++;
-                if (mono_suspend_read_count > 64) {
-                    // Thread was resumed but re-faulted. Try to re-signal,
-                    // but only if the handler has finished processing the
-                    // previous exception (pending == false).
-                    auto pc = this->cpu->get_pc();
-                    mono_suspend_read_count = 0;
-                    
-                    // Check if handler is ready for a new signal
-                    bool handler_ready = false;
-                    if (parent->protocol) {
-                        // signal_mono_exception checks pending internally —
-                        // if pending is true, it returns false (BLOCKED).
-                        // We just try and reset only on success.
-                        mono_exception_signaled = false;
-                        if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
-                            LOG_WARN("Re-signaling Mono exception for thread (PC=0x{:X}, addr=0x{:X})", pc, addr);
-                            mono_exception_signaled = true;
-                            cpu->jit->HaltExecution();
-                            return 0;
-                        }
-                        // Handler not ready yet — keep waiting
-                        mono_exception_signaled = true;
-                    }
-                }
                 return 0;
             }
 
             auto pc = this->cpu->get_pc();
 
-            // Null pointer data read (addr in first page) — signal Mono exception.
-            // But don't re-signal if already signaled in this run().
-            if (addr < parent->mem->page_size && parent->protocol && !mono_exception_signaled) {
-                auto lr = cpu->get_lr();
+            // Mono null-reference detection: on real Vita, accessing NULL+offset
+            // (for object field reads like ldr r0, [r1, #0x44] where r1=NULL)
+            // causes a data abort that the kernel signals to Mono's exception
+            // handler. The Vita maps the first 64KB as a guard region.
+            // We must use 64KB here, NOT the host page_size (16KB on macOS ARM64),
+            // otherwise null dereferences at offsets >16KB are missed and cause
+            // the thread to enter the generic "invalid read" path instead of
+            // being properly handled by Mono as NullReferenceException.
+            constexpr uint32_t MONO_NULL_PAGE_SIZE = 0x10000; // 64KB
+            if (addr < MONO_NULL_PAGE_SIZE && parent->protocol && !mono_exception_signaled) {
                 if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
                     mono_exception_signaled = true;
                     cpu->jit->HaltExecution();
                     return 0;
                 }
-                // Signal BLOCKED — wait and retry (same as MemoryReadCode fix)
-                int wait_count = 0;
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
-                        mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return 0;
-                    }
-                    if (++wait_count > 100000) {
-                        LOG_ERROR("Mono data exception signal timeout for thread {}", parent->thread_id);
-                        break;
-                    }
-                }
+                // Signal was BLOCKED (another exception pending). Don't busy-wait.
+                // Return 0 and let the basic block finish. The thread will be
+                // re-scheduled and can retry. Busy-waiting here deadlocks because
+                // the handler thread needs CPU time to process the pending exception.
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
@@ -401,20 +364,8 @@ public:
                     cpu->jit->HaltExecution();
                     return;
                 }
-                // Wait-retry if BLOCKED (same as MemoryReadCode)
-                int wait_count = 0;
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
-                        mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return;
-                    }
-                    if (++wait_count > 100000) {
-                        LOG_ERROR("Mono write exception signal timeout for thread {}", parent->thread_id);
-                        break;
-                    }
-                }
+                // If BLOCKED, don't busy-wait. Halt and let the scheduler retry.
+                cpu->jit->HaltExecution();
             }
             return;
         }
@@ -577,7 +528,6 @@ int DynarmicCPU::run() {
     exit_request = false;
     parent->svc_called = false;
     cb->mono_exception_signaled = false;
-    cb->mono_suspend_read_count = 0;
     Dynarmic::HaltReason halt_reason;
     do {
         halt_reason = jit->Run();

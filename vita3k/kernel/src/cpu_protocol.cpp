@@ -55,33 +55,9 @@ void CPUProtocol::call_svc(CPUState &cpu, uint32_t svc, Address pc, ThreadState 
     // This is usual service call
     uint32_t nid = *Ptr<uint32_t>(pc + 4).get(*mem);
 
-    // Debug: trace the pthread function that converts SceUID to exception table key.
-    // NID 0x23D5CB94 is called by the Mono exception callback to look up the
-    // faulting thread. Logging its input/output reveals what the search key is.
-    bool trace_nid = (nid == 0x23D5CB94);
-    uint32_t trace_r0_in = 0, trace_r1_in = 0;
-    if (trace_nid) {
-        trace_r0_in = read_reg(cpu, 0);
-        trace_r1_in = read_reg(cpu, 1);
-    }
-
     // TODO: just supply ThreadStatePtr to call_import
     // the only benefit of using thread_id instead--namely less locking-- has been gone for long
     call_import(cpu, nid, thread.id);
-
-    if (trace_nid) {
-        uint32_t trace_r0_out = read_reg(cpu, 0);
-        // Read the output value written to [r1_in]
-        uint32_t output_val = 0;
-        if (trace_r1_in) {
-            Ptr<uint32_t> out_ptr(trace_r1_in);
-            if (out_ptr.valid(*mem)) {
-                output_val = *out_ptr.get(*mem);
-            }
-        }
-        LOG_WARN("NID 0x23D5CB94: r0_in=0x{:X} r1_in=0x{:X} → r0_out=0x{:X} output_val=0x{:X}",
-                 trace_r0_in, trace_r1_in, trace_r0_out, output_val);
-    }
 
     // ARM recommends clearing exclusive state inside interrupt handler
     clear_exclusive(kernel->exclusive_monitor, get_processor_id(cpu));
@@ -124,9 +100,6 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
         }
 
         // Don't re-signal the same thread that was just processed.
-        // The wait-retry loop can re-signal after the handler finishes,
-        // but by then the thread's PC is stale (0x0). The original signal
-        // had the correct PC. Skip re-signaling to preserve the correct context.
         if (kernel->mono_exception_last_thread == thread_id && fault_pc == 0) {
             return false;
         }
@@ -140,76 +113,25 @@ bool CPUProtocol::signal_mono_exception(int thread_id, Address fault_addr, Addre
         sema = kernel->mono_exception_sema;
     }
 
-    LOG_WARN("signal_mono_exception: thread {}, fault_pc=0x{:08X}", thread_id, fault_pc);
+    LOG_WARN("signal_mono_exception: thread {}, fault_pc=0x{:08X}, fault_addr=0x{:08X}", thread_id, fault_pc, fault_addr);
 
-    // Use the LIVE context from jit->Regs().
-    // Dynarmic ARM64 backend stores guest registers directly in JitState.regs[]
-    // (via STR on every A32SetRegister IR op), so r0-r14 are accurate during
-    // MemoryRead/MemoryReadCode callbacks. Only r15 (PC) is stale — it's set
-    // at block exit, not per-instruction. We override it with fault_pc.
+    // *** FIX: Do NOT save the context here. ***
     //
-    // Previous approach used pre_run_context (saved before run()) which was
-    // potentially hundreds of basic blocks stale — that caused the re-fault
-    // because the Mono callback received wrong r0/SP/LR values.
+    // We are inside a Dynarmic MemoryRead/MemoryReadCode callback. Dynarmic's
+    // ARM64 backend has NOT committed the guest register state to JitState.regs[]
+    // at this point — those values reflect the start of the current basic block,
+    // not the actual state at the faulting instruction. Calling save_context()
+    // here returns STALE r0-r14 values.
+    //
+    // On real Vita hardware, the kernel saves the exact register state at the
+    // faulting instruction via the hardware exception mechanism.
+    //
+    // Our fix: mark that a context save is needed, then let WaitExceptionForMono
+    // save the context AFTER run() has returned and Dynarmic has committed all
+    // register state. The fault_pc and fault_addr are stored above and are correct.
+
     auto faulting_thread = kernel->get_thread(thread_id);
     if (faulting_thread) {
-        {
-            std::lock_guard<std::mutex> lock(kernel->mono_exception_mutex);
-            kernel->mono_exception_saved_context = save_context(*faulting_thread->cpu);
-            kernel->mono_exception_saved_context.cpu_registers[15] = fault_pc;
-
-            auto &ctx = kernel->mono_exception_saved_context;
-            LOG_WARN("signal_mono_exception: saved LIVE context r0=0x{:08X} SP=0x{:08X} LR=0x{:08X}",
-                     ctx.cpu_registers[0], ctx.cpu_registers[13], ctx.cpu_registers[14]);
-
-            // Dump all registers for debugging vtable null entry
-            LOG_WARN("  regs: r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} r5={:08X}",
-                     ctx.cpu_registers[0], ctx.cpu_registers[1], ctx.cpu_registers[2],
-                     ctx.cpu_registers[3], ctx.cpu_registers[4], ctx.cpu_registers[5]);
-            LOG_WARN("  regs: r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X} r11(fp)={:08X} r12={:08X}",
-                     ctx.cpu_registers[6], ctx.cpu_registers[7], ctx.cpu_registers[8],
-                     ctx.cpu_registers[9], ctx.cpu_registers[10], ctx.cpu_registers[11], ctx.cpu_registers[12]);
-
-            // If fp (r11) is valid, dump the stack frame (the object and args)
-            MemState &mstate = *this->mem;
-            Address fp_addr = ctx.cpu_registers[11];
-            if (fp_addr > 0x1000 && fp_addr < 0xF0000000) {
-                Ptr<uint32_t> fp_ptr(fp_addr);
-                if (fp_ptr.valid(mstate)) {
-                    uint32_t *fp_data = fp_ptr.get(mstate);
-                    LOG_WARN("  [fp+0]={:08X} [fp+4]={:08X} [fp+8]={:08X} [fp+C]={:08X}",
-                             fp_data[0], fp_data[1], fp_data[2], fp_data[3]);
-
-                    // fp+4 is the object pointer in the faulting code at 0x8236FE*
-                    uint32_t obj_addr = fp_data[1];
-                    if (obj_addr > 0x1000 && obj_addr < 0xF0000000) {
-                        Ptr<uint32_t> obj_ptr(obj_addr);
-                        if (obj_ptr.valid(mstate)) {
-                            uint32_t *obj_data = obj_ptr.get(mstate);
-                            LOG_WARN("  object@{:08X}: [{:08X} {:08X} {:08X} {:08X}]",
-                                     obj_addr, obj_data[0], obj_data[1], obj_data[2], obj_data[3]);
-
-                            // obj_data[0] is the vtable pointer
-                            uint32_t vtable_addr = obj_data[0];
-                            if (vtable_addr > 0x1000 && vtable_addr < 0xF0000000) {
-                                Ptr<uint32_t> vt_ptr(vtable_addr);
-                                if (vt_ptr.valid(mstate)) {
-                                    uint32_t *vt = vt_ptr.get(mstate);
-                                    LOG_WARN("  vtable@{:08X}: [0]={:08X} [4]={:08X} [8]={:08X} [C]={:08X}",
-                                             vtable_addr, vt[0], vt[1], vt[2], vt[3]);
-                                    LOG_WARN("  vtable: [10]={:08X} [14]={:08X} [18]={:08X} [1C]={:08X}",
-                                             vt[4], vt[5], vt[6], vt[7]);
-                                    LOG_WARN("  vtable: [20]={:08X} [24]={:08X} [28]={:08X} [2C]={:08X}",
-                                             vt[8], vt[9], vt[10], vt[11]);
-                                    LOG_WARN("  vtable: [30]={:08X} [34]={:08X} [38]={:08X} [3C]={:08X}",
-                                             vt[12], vt[13], vt[14], vt[15]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         faulting_thread->suspend();
     }
 

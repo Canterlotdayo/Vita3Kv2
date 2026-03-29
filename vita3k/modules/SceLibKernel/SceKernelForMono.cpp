@@ -76,10 +76,14 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         emuenv.kernel.mono_exception_pending = false;
     }
 
-    // Wait for the faulting thread to actually reach suspend state
+    // Wait for the faulting thread to actually reach suspend state.
+    // This is CRITICAL: we must wait until Dynarmic's run() has returned
+    // and the thread's run_loop has reached the suspend wait. Only then
+    // has Dynarmic committed all guest registers to JitState, making
+    // save_context() return accurate values.
     auto faulting_thread = emuenv.kernel.get_thread(faulting_tid);
     if (faulting_thread) {
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < 10000; i++) {
             {
                 std::lock_guard<std::mutex> tlock(faulting_thread->mutex);
                 if (faulting_thread->status == ThreadStatus::suspend ||
@@ -89,6 +93,23 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
                 }
             }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        // *** FIX: Save the context NOW, after run() has returned. ***
+        //
+        // At this point Dynarmic has fully committed all guest registers
+        // back to JitState. save_context() will return the accurate r0-r14
+        // state. We only need to override PC with the fault_pc, since
+        // Dynarmic sets PC to the end of the last executed basic block
+        // rather than the exact faulting instruction.
+        {
+            std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+            emuenv.kernel.mono_exception_saved_context = save_context(*faulting_thread->cpu);
+            emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_pc;
+
+            auto &ctx = emuenv.kernel.mono_exception_saved_context;
+            LOG_WARN("WaitExceptionForMono: saved post-run context for thread {} PC=0x{:08X} SP=0x{:08X} LR=0x{:08X}",
+                     faulting_tid, fault_pc, ctx.cpu_registers[13], ctx.cpu_registers[14]);
         }
     }
 
