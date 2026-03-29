@@ -98,15 +98,45 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         }
 
         // Save the context NOW, after run() has returned and registers are committed.
-        // Override PC with fault_pc since Dynarmic's PC points to the block end.
         {
             std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
             emuenv.kernel.mono_exception_saved_context = save_context(*faulting_thread->cpu);
-            emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_pc;
 
+            Address committed_pc = emuenv.kernel.mono_exception_saved_context.cpu_registers[15];
+
+            if (is_prefetch) {
+                // PREFETCH abort: fault_pc is LR (set by MemoryReadCode), which is the
+                // address of the call instruction that jumped to NULL. This is correct.
+                emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_pc;
+            } else {
+                // DATA abort: fault_pc comes from get_pc() during the MemoryRead callback,
+                // which is STALE (Dynarmic doesn't update PC per-instruction during JIT
+                // execution). The committed PC from save_context() is what Dynarmic set
+                // when HaltExecution was processed — it's near the faulting instruction.
+                // If the committed PC looks valid (in a loaded module), use it.
+                // Otherwise fall back to fault_pc, then LR.
+                Address lr = emuenv.kernel.mono_exception_saved_context.cpu_registers[14];
+                if (committed_pc >= 0x80000000 && committed_pc < 0x90000000) {
+                    // Committed PC is in the guest address range — use it as-is
+                    // (don't override, save_context already set it)
+                } else if (fault_pc >= 0x80000000 && fault_pc < 0x90000000) {
+                    // fault_pc looks valid — use it
+                    emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_pc;
+                } else if (lr >= 0x80000000 && lr < 0x90000000) {
+                    // Use LR as last resort — it's the return address
+                    emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = lr;
+                }
+                // else: leave committed_pc as-is, even if it looks bad
+            }
+
+            Address final_pc = emuenv.kernel.mono_exception_saved_context.cpu_registers[15];
             auto &ctx = emuenv.kernel.mono_exception_saved_context;
-            LOG_WARN("WaitExceptionForMono: saved post-run context for thread {} PC=0x{:08X} SP=0x{:08X} LR=0x{:08X}",
-                     faulting_tid, fault_pc, ctx.cpu_registers[13], ctx.cpu_registers[14]);
+            LOG_WARN("WaitExceptionForMono: thread {} committed_pc=0x{:08X} fault_pc=0x{:08X} final_pc=0x{:08X} SP=0x{:08X} LR=0x{:08X} type={}",
+                     faulting_tid, committed_pc, fault_pc, final_pc, ctx.cpu_registers[13], ctx.cpu_registers[14],
+                     is_prefetch ? "PREFETCH" : "DATA");
+
+            // Also update fault_pc for the pInfo struct below
+            fault_pc = final_pc;
         }
     }
 
