@@ -685,13 +685,23 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
         CPUContext old_ctx = save_context(*thread->cpu);
         uint32_t old_pc = old_ctx.cpu_registers[15];
         uint32_t new_pc = infoCpu->reg[15];
-        LOG_WARN("SetThreadContextForVM: thread {} PC 0x{:X} -> 0x{:X}, LR 0x{:X} -> 0x{:X}",
-                 threadId, old_pc, new_pc, old_ctx.cpu_registers[14], infoCpu->reg[14]);
-        LOG_WARN("  SetCtx regs: r0={:08X} r9={:08X} SP={:08X} tpidrurw={:08X}",
-                 infoCpu->reg[0], infoCpu->reg[9], infoCpu->reg[13], infoCpu->tpidrurw);
 
         memcpy(old_ctx.cpu_registers.data(), infoCpu->reg, 16 * 4);
         old_ctx.cpsr = infoCpu->cpsr;
+
+        // Fix ARM/Thumb mode based on PC bit 0 (ARM interworking convention).
+        // On real Vita, the kernel sets the Thumb bit in CPSR from PC bit 0.
+        // PC bit 0 = 1 → Thumb mode; PC bit 0 = 0 → ARM mode.
+        // Without this, setting PC to ARM code (like Mono's exception trampoline
+        // at 0x84D652E8) while CPSR has Thumb set (from JIT code) causes the
+        // thread to decode ARM instructions as Thumb → crash.
+        if (new_pc & 1) {
+            old_ctx.cpsr |= 0x20;          // Set Thumb bit
+            old_ctx.cpu_registers[15] &= ~1u; // Clear bit 0 of PC
+        } else {
+            old_ctx.cpsr &= ~0x20u;        // Clear Thumb bit (ARM mode)
+        }
+
         load_context(*thread->cpu, old_ctx);
         write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
     }
