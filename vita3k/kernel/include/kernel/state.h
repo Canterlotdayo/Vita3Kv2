@@ -162,6 +162,17 @@ struct KernelState {
     // Serializes Mono worker thread execution to prevent race conditions.
     std::mutex mono_thread_mutex;
 
+    // Serializes JIT code execution across guest threads.
+    // On real Vita, game threads share a single CPU core and are time-sliced
+    // cooperatively — they never run JIT code in true parallel. Vita3K runs
+    // each guest thread on its own host thread, causing data races in Mono's
+    // managed heap, GC structures, and JIT code cache. This mutex ensures
+    // only one guest thread executes JIT code at a time, matching the Vita's
+    // single-core behavior for game logic threads.
+    // The mutex is held only during cpu run(), not during SVC handling
+    // (I/O, sleep, wait), so blocking operations don't starve other threads.
+    std::mutex jit_run_mutex;
+
     // Mono exception handler mechanism:
     // On real Vita, when a thread hits a null pointer / illegal access, the kernel
     // converts the hardware fault into a signal that wakes the Mono exception handler

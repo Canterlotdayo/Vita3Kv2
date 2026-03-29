@@ -266,7 +266,25 @@ bool ThreadState::run_loop() {
                     to_do = ThreadToDo::suspend;
                 } else {
                     cpu->pre_run_context = save_context(*cpu);
+
+                    // Serialize JIT execution across guest threads.
+                    // On real Vita, game threads share a single CPU core and are
+                    // time-sliced — they never execute JIT code in true parallel.
+                    // Without this, Mono's managed heap gets corrupted by concurrent
+                    // access from multiple threads (the Mono GC and JIT assume
+                    // single-core cooperative scheduling).
+                    // We hold the lock only during run() (JIT execution), not during
+                    // SVC handling below, so I/O, sleep, and wait operations don't
+                    // starve other threads.
+                    if (kernel.mono_code_start != 0) {
+                        kernel.jit_run_mutex.lock();
+                    }
+
                     res = run(*cpu);
+
+                    if (kernel.mono_code_start != 0) {
+                        kernel.jit_run_mutex.unlock();
+                    }
                 }
 
                 // handle svc call if this was what stopped the cpu
