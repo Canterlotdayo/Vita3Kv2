@@ -34,6 +34,7 @@
 #include <packages/sce_types.h>
 #include <patch/patch.h>
 #include <util/find.h>
+#include <util/arm.h>
 #include <util/lock_and_find.h>
 #include <util/log.h>
 #include <util/string_utils.h>
@@ -298,6 +299,54 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
         LOG_INFO("Module {} (at \"{}\") module_start returned {}", module_name, module.path, log_hex(ret));
         if (ret != SCE_KERNEL_START_SUCCESS)
             LOG_ERROR("Module {} did not return successfully!", module_name);
+
+        // Re-resolve mono-vita's import stubs after module_start.
+        // mono-vita's module_start overwrites its own resolved import stubs
+        // with fallback code (mvn r0, #0; bx lr). On real Vita, import stubs
+        // are in read-only memory and module_start can't overwrite them.
+        // Vita3K has no memory protection (all RWX), so module_start destroys
+        // all 145 resolved imports (sceIoOpen, sceKernelWaitExceptionForMono, etc.).
+        // Fix: re-write the correct stub code after module_start returns.
+        if (std::string(module.path).find("mono-vita") != std::string::npos) {
+            const auto &kernel = emuenv.kernel;
+            const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
+            int restored = 0;
+            Address mono_code_start = kernel.mono_code_start;
+            Address mono_code_end = kernel.mono_code_end;
+
+            for (const auto &[nid, stub_addr] : kernel.func_binding_infos) {
+                // Only fix mono-vita's import stubs
+                if (stub_addr < mono_code_start || stub_addr >= mono_code_end)
+                    continue;
+
+                uint32_t *stub = Ptr<uint32_t>(stub_addr).get(emuenv.mem);
+                if (!stub)
+                    continue;
+
+                // Check if this stub was overwritten (fallback pattern)
+                if (stub[0] != 0xE3E00000 || stub[1] != 0xE12FFF1E)
+                    continue;
+
+                // Re-write the stub with the correct resolution
+                auto export_it = kernel.export_nids.find(nid);
+                if (export_it != kernel.export_nids.end()) {
+                    // Resolved: movw ip, lo; movt ip, hi; bx ip
+                    Address func_address = export_it->second;
+                    stub[0] = encode_arm_inst(INSTRUCTION_MOVW, (uint16_t)func_address, 12);
+                    stub[1] = encode_arm_inst(INSTRUCTION_MOVT, (uint16_t)(func_address >> 16), 12);
+                    stub[2] = encode_arm_inst(INSTRUCTION_BRANCH, 0, 12);
+                } else {
+                    // Not resolved: svc #0; mov pc, lr; nid
+                    stub[0] = 0xEF000000;
+                    stub[1] = 0xE1A0F00E;
+                    stub[2] = nid;
+                }
+                emuenv.kernel.invalidate_jit_cache(stub_addr, 12);
+                restored++;
+            }
+            if (restored > 0)
+                LOG_INFO("Mono: re-resolved {} import stubs overwritten by module_start", restored);
+        }
 
         return ret;
     }
