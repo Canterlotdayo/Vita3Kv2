@@ -704,6 +704,12 @@ EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
 
         load_context(*thread->cpu, old_ctx);
         write_tpidruro(*thread->cpu, infoCpu->tpidrurw);
+
+        // Invalidate JIT cache at the new PC. Dynarmic caches compiled blocks
+        // by address. If the block was previously compiled in a different mode
+        // (Thumb vs ARM), the cached block decodes instructions incorrectly.
+        // Force recompilation with the correct CPSR Thumb bit.
+        invalidate_jit_cache(*thread->cpu, old_ctx.cpu_registers[15], 4);
     }
 
     SceKernelThreadVfpRegisterInfo *infoVfp = pVfpRegisterInfo.get(emuenv.mem);
