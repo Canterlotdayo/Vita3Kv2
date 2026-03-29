@@ -309,6 +309,8 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
         // Fix: re-write the correct stub code after module_start returns.
         if (std::string(module.path).find("mono-vita") != std::string::npos) {
             auto &kernel = emuenv.kernel;
+            LOG_INFO("Mono: post-module_start import stub restoration starting (code range 0x{:08X}-0x{:08X})",
+                     kernel.mono_code_start, kernel.mono_code_end);
             const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
             int restored = 0;
             Address mono_code_start = kernel.mono_code_start;
@@ -346,6 +348,8 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
             }
             if (restored > 0)
                 LOG_INFO("Mono: re-resolved {} import stubs overwritten by module_start", restored);
+            else
+                LOG_WARN("Mono: restoration found 0 overwritten stubs (func_binding_infos has {} entries)", kernel.func_binding_infos.size());
         }
 
         return ret;
