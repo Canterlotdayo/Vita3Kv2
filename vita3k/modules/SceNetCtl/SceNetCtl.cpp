@@ -672,8 +672,14 @@ EXPORT(int, sceNetCtlInetGetState, int *state) {
         return RET_ERROR(SCE_NET_CTL_ERROR_INVALID_ADDR);
     }
 
-    *state = SCE_NET_CTL_STATE_IPOBTAINED;
-    return STUBBED("state = SCE_NETCTL_STATE_CONNECTED");
+    // Return DISCONNECTED to be consistent with sceNetCtlCheckCallback which
+    // fires SCE_NET_CTL_EVENT_TYPE_DISCONNECTED. Without real PSN connectivity,
+    // returning IPOBTAINED (connected) causes games to partially initialize
+    // network features, then crash when the DISCONNECTED callback fires —
+    // the tear-down hits null pointers in partially-initialized objects.
+    // On a real Vita without network, this returns DISCONNECTED.
+    *state = SCE_NET_CTL_STATE_DISCONNECTED;
+    return STUBBED("state = SCE_NETCTL_STATE_DISCONNECTED");
 }
 
 EXPORT(int, sceNetCtlInetRegisterCallback, Ptr<void> func, Ptr<void> arg, int *cid) {
