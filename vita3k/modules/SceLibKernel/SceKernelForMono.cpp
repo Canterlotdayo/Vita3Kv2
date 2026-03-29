@@ -46,8 +46,8 @@ EXPORT(int, sceKernelSuspendThreadForMono, SceUID threadId) {
     return CALL_EXPORT(sceKernelSuspendThreadForVM, threadId);
 }
 
-EXPORT(int, sceKernelWaitExceptionForMono, Ptr<uint32_t> pInfo, int type, int flags) {
-    TRACY_FUNC(sceKernelWaitExceptionForMono, pInfo, type, flags);
+EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int flags) {
+    TRACY_FUNC(sceKernelWaitExceptionForMono, type, pInfo, flags);
 
     LOG_INFO("sceKernelWaitExceptionForMono: ExceptionHandlerThread (ID: {}) waiting for exceptions...", thread_id);
 
@@ -105,9 +105,18 @@ EXPORT(int, sceKernelWaitExceptionForMono, Ptr<uint32_t> pInfo, int type, int fl
             Address committed_pc = emuenv.kernel.mono_exception_saved_context.cpu_registers[15];
 
             if (is_prefetch) {
-                // PREFETCH abort: fault_pc is LR (set by MemoryReadCode), which is the
-                // address of the call instruction that jumped to NULL. This is correct.
-                emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_pc;
+                // PREFETCH abort: On real Vita hardware, a prefetch abort saves
+                // PC = the address that failed to fetch (e.g. 0x0 for null ptr call).
+                // The caller's return address is in LR (set by BLX before the abort).
+                // Mono checks: if saved PC is in null page → NullReferenceException,
+                // then uses LR to find the JIT method that made the call and locate
+                // the C# catch handler.
+                //
+                // fault_addr = the address that was fetched (0x0 for null ptr)
+                // fault_pc = LR from MemoryReadCode (the caller's return address)
+                // We set PC = fault_addr to match real hardware behavior.
+                // LR in the saved context is already correct (committed by Dynarmic).
+                emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_addr;
             } else {
                 // DATA abort: fault_pc comes from get_pc() during the MemoryRead callback,
                 // which is STALE (Dynarmic doesn't update PC per-instruction during JIT
@@ -164,7 +173,7 @@ EXPORT(int, sceKernelWaitExceptionForMono, Ptr<uint32_t> pInfo, int type, int fl
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, sceKernelWaitExceptionCBForMono, Ptr<uint32_t> pInfo, int type, int flags) {
-    TRACY_FUNC(sceKernelWaitExceptionCBForMono, pInfo, type, flags);
-    return CALL_EXPORT(sceKernelWaitExceptionForMono, pInfo, type, flags);
+EXPORT(int, sceKernelWaitExceptionCBForMono, int type, Ptr<uint32_t> pInfo, int flags) {
+    TRACY_FUNC(sceKernelWaitExceptionCBForMono, type, pInfo, flags);
+    return CALL_EXPORT(sceKernelWaitExceptionForMono, type, pInfo, flags);
 }
