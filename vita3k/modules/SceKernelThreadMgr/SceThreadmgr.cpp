@@ -1428,13 +1428,32 @@ EXPORT(int, sceKernelStopTimer, SceUID timer_handle) {
 
 EXPORT(int, sceKernelSuspendThreadForVM, SceUID threadId) {
     TRACY_FUNC(sceKernelSuspendThreadForVM, threadId);
-    STUBBED("STUB");
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(threadId);
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
     thread->suspend();
+
+    // Wait for the thread to actually reach suspended state.
+    // On real Vita, SuspendThread is synchronous — the thread is stopped
+    // when the call returns. In Vita3K, HaltExecution is asynchronous
+    // (the thread finishes its current basic block first). The Boehm GC
+    // relies on synchronous suspension: after SuspendThread returns, it
+    // assumes the thread is stopped and begins collecting. Without this
+    // wait, the GC frees objects that threads still reference → use-after-free
+    // → vtable/JIT info corruption → NullReferenceException handler fails.
+    for (int i = 0; i < 10000; i++) {
+        {
+            std::lock_guard<std::mutex> tlock(thread->mutex);
+            if (thread->status == ThreadStatus::suspend ||
+                thread->status == ThreadStatus::wait ||
+                thread->status == ThreadStatus::dormant) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 
     return 0;
 }
