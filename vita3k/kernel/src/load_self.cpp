@@ -831,7 +831,7 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             //   E3A00000  mov r0, #0         ← return success
             {
                 uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
-                uint32_t code_words = (code_end - code_start) / 4;
+                uint32_t code_words = code_size / 4;
                 bool tls_patched = false;
                 for (uint32_t i = 0; i + 3 < code_words; i++) {
                     if (code[i]   == 0xE28D1000 &&  // add r1, sp, #0
