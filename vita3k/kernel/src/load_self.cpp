@@ -781,7 +781,7 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             // Patch to: push {lr}; blx r0; pop {pc} (call r0 and return result).
             {
                 Address code_start = segment_reloc_info[0].addr;
-                constexpr uint32_t CALLBACK_INVOKER_OFFSET = 0x19B700;
+                constexpr uint32_t CALLBACK_INVOKER_OFFSET = 0x199700;
                 Address stub_addr = code_start + CALLBACK_INVOKER_OFFSET;
                 uint32_t *stub = Ptr<uint32_t>(stub_addr).get(mem);
                 if (stub && stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E) {
