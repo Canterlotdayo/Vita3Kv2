@@ -135,7 +135,7 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         }
     }
 
-    // Dump exception table to understand the entry format used by Mono's own registration.
+    // Diagnostic: dump exception table AND libc callback tables
     if (emuenv.kernel.mono_data_start != 0) {
         constexpr uint32_t EXCEPTION_TABLE_OFFSET = 0x66A10;
         constexpr uint32_t EXCEPTION_COUNTER_OFFSET = 0x4F34;
@@ -145,21 +145,48 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         uint32_t *counter = Ptr<uint32_t>(counter_addr).get(emuenv.mem);
         uint32_t count = *counter;
 
-        LOG_WARN("Exception table dump: count={}, faulting_tid={}", count, faulting_tid);
+        // Check if faulting thread is in the table
+        bool found = false;
         if (count < 256) {
             uint32_t *table = Ptr<uint32_t>(table_addr).get(emuenv.mem);
-            for (uint32_t i = 0; i < count && i < 5; i++) {
+            for (uint32_t i = 0; i < count; i++) {
                 if (table[i]) {
                     uint32_t *entry = Ptr<uint32_t>(table[i]).get(emuenv.mem);
-                    if (entry) {
-                        LOG_WARN("  table[{}] = 0x{:08X} → [0]={:08X} [1]={:08X} [2]={:08X} [3]={:08X}",
-                                 i, table[i], entry[0], entry[1], entry[2], entry[3]);
+                    if (entry && entry[0] == static_cast<uint32_t>(faulting_tid)) {
+                        found = true;
+                        LOG_WARN("Exception table: faulting thread {} FOUND at idx={}", faulting_tid, i);
+                        break;
                     }
-                } else {
-                    LOG_WARN("  table[{}] = NULL", i);
                 }
             }
-            if (count > 5) LOG_WARN("  ... ({} more entries)", count - 5);
+        }
+        if (!found) {
+            LOG_WARN("Exception table: faulting thread {} NOT FOUND in {} entries", faulting_tid, count);
+        }
+
+        // Dump libc callback tables via mono-vita import entries.
+        // These are at fixed offsets from mono code segment start.
+        // The import entry contains a pointer to the libc variable.
+        Address code_start = emuenv.kernel.mono_code_start;
+        if (code_start) {
+            // Offsets of variable import entries in code segment (from ELF analysis)
+            constexpr uint32_t VAR_IMPORT_OFFSETS[] = { 0x1A0A7C, 0x1A0948, 0x1A0BD0 };
+            const char *VAR_NAMES[] = { "0x3CE6109D", "0x5D8C1282", "0xD662E07C" };
+            for (int v = 0; v < 3; v++) {
+                Address entry_addr = code_start + VAR_IMPORT_OFFSETS[v];
+                Ptr<uint32_t> entry_ptr(entry_addr);
+                if (entry_ptr.valid(emuenv.mem)) {
+                    Address libc_addr = *entry_ptr.get(emuenv.mem);
+                    LOG_WARN("Callback table NID {} → entry@0x{:08X} → libc@0x{:08X}", VAR_NAMES[v], entry_addr, libc_addr);
+                    if (libc_addr && libc_addr != 0xDEADBEEF) {
+                        Ptr<uint32_t> tbl(libc_addr);
+                        if (tbl.valid(emuenv.mem)) {
+                            uint32_t *t = tbl.get(emuenv.mem);
+                            LOG_WARN("  contents: [{:08X}] [{:08X}] [{:08X}] [{:08X}]", t[0], t[1], t[2], t[3]);
+                        }
+                    }
+                }
+            }
         }
     }
 
