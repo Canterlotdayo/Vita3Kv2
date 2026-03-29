@@ -103,49 +103,47 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
             emuenv.kernel.mono_exception_saved_context = save_context(*faulting_thread->cpu);
 
             Address committed_pc = emuenv.kernel.mono_exception_saved_context.cpu_registers[15];
+            Address lr = emuenv.kernel.mono_exception_saved_context.cpu_registers[14];
 
+            // Determine the best PC to put in the saved context.
+            // Mono uses this PC (via GetThreadContextForVM) AND info[3] (in pInfo)
+            // to look up JIT metadata and find the C# catch handler.
+            // The PC MUST be a valid code address in a loaded module or JIT region,
+            // otherwise Mono can't find metadata and skips handling.
+            //
+            // For PREFETCH abort (null function pointer call):
+            //   fault_addr = target that failed to fetch (e.g. 0x0)
+            //   fault_pc = LR from MemoryReadCode = caller's return address
+            //   Use fault_pc (LR) — it points to the caller which has JIT metadata.
+            //
+            // For DATA abort (null dereference read/write):
+            //   fault_addr = address that was read/written
+            //   fault_pc = stale get_pc() from MemoryRead callback (often garbage)
+            //   committed_pc = PC after run() returned (may or may not be valid)
+            //   Use committed_pc if valid, else fault_pc if valid, else LR as fallback.
+
+            Address best_pc;
             if (is_prefetch) {
-                // PREFETCH abort: On real Vita hardware, a prefetch abort saves
-                // PC = the address that failed to fetch (e.g. 0x0 for null ptr call).
-                // The caller's return address is in LR (set by BLX before the abort).
-                // Mono checks: if saved PC is in null page → NullReferenceException,
-                // then uses LR to find the JIT method that made the call and locate
-                // the C# catch handler.
-                //
-                // fault_addr = the address that was fetched (0x0 for null ptr)
-                // fault_pc = LR from MemoryReadCode (the caller's return address)
-                // We set PC = fault_addr to match real hardware behavior.
-                // LR in the saved context is already correct (committed by Dynarmic).
-                emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_addr;
+                best_pc = fault_pc; // = LR from MemoryReadCode (caller address)
             } else {
-                // DATA abort: fault_pc comes from get_pc() during the MemoryRead callback,
-                // which is STALE (Dynarmic doesn't update PC per-instruction during JIT
-                // execution). The committed PC from save_context() is what Dynarmic set
-                // when HaltExecution was processed — it's near the faulting instruction.
-                // If the committed PC looks valid (in a loaded module), use it.
-                // Otherwise fall back to fault_pc, then LR.
-                Address lr = emuenv.kernel.mono_exception_saved_context.cpu_registers[14];
                 if (committed_pc >= 0x80000000 && committed_pc < 0x90000000) {
-                    // Committed PC is in the guest address range — use it as-is
-                    // (don't override, save_context already set it)
+                    best_pc = committed_pc;
                 } else if (fault_pc >= 0x80000000 && fault_pc < 0x90000000) {
-                    // fault_pc looks valid — use it
-                    emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = fault_pc;
+                    best_pc = fault_pc;
                 } else if (lr >= 0x80000000 && lr < 0x90000000) {
-                    // Use LR as last resort — it's the return address
-                    emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = lr;
+                    best_pc = lr;
+                } else {
+                    best_pc = committed_pc; // last resort
                 }
-                // else: leave committed_pc as-is, even if it looks bad
             }
 
-            Address final_pc = emuenv.kernel.mono_exception_saved_context.cpu_registers[15];
+            emuenv.kernel.mono_exception_saved_context.cpu_registers[15] = best_pc;
+            fault_pc = best_pc; // update for pInfo below
+
             auto &ctx = emuenv.kernel.mono_exception_saved_context;
             LOG_WARN("WaitExceptionForMono: thread {} committed_pc=0x{:08X} fault_pc=0x{:08X} final_pc=0x{:08X} SP=0x{:08X} LR=0x{:08X} type={}",
-                     faulting_tid, committed_pc, fault_pc, final_pc, ctx.cpu_registers[13], ctx.cpu_registers[14],
+                     faulting_tid, committed_pc, fault_pc, best_pc, ctx.cpu_registers[13], ctx.cpu_registers[14],
                      is_prefetch ? "PREFETCH" : "DATA");
-
-            // Also update fault_pc for the pInfo struct below
-            fault_pc = final_pc;
         }
     }
 
