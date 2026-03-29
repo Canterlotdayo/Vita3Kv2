@@ -27,6 +27,7 @@
 #include <util/log.h>
 
 #include <util/elf.h>
+#include <set>
 // clang-format off
 #define SCE_ELF_DEFS_TARGET
 #include <sce-elf-defs.h>
@@ -769,9 +770,72 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             kernel.mono_code_end = segment_reloc_info[0].addr + segment_reloc_info[0].size;
             LOG_INFO("Mono module detected: code segment [0x{:08X} - 0x{:08X}]",
                      kernel.mono_code_start, kernel.mono_code_end);
+            // Patch mono-vita's internal callback invoker stubs.
+            // mono-vita has ~159 internal fallback stubs ("mvn r0, #0; bx lr").
+            // Some of these are callback INVOKERS: they receive a function pointer
+            // in r0 and should CALL it. On real Vita, SceLibMonoBridge provides
+            // the real implementations. In Vita3K, the stubs return -1 without
+            // calling → callbacks (including the exception handler) never run.
+            //
+            // Dynamically find callback invoker stubs by scanning for the caller
+            // pattern: "ldr r0, [rN, #0x28]" (load callback ptr) followed by
+            // "blx ip" where ip targets a fallback stub. Patch each matching
+            // stub to: push {lr}; blx r0; pop {pc} (call the function pointer).
+            {
+                Address code_start = segment_reloc_info[0].addr;
+                size_t code_size = segment_reloc_info[0].size;
+                uint32_t *code = Ptr<uint32_t>(code_start).get(mem);
+                std::set<uint32_t> patched_offsets;
 
-        }
-        if (segment_reloc_info.count(1)) {
+                if (code && code_size > 32) {
+                    for (size_t i = 0; i < code_size / 4 - 8; i++) {
+                        // Match: ldr r0, [rN, #0x28] = E59X0028 where X = 0-F
+                        if ((code[i] & 0xFFF0FFFF) != 0xE5900028)
+                            continue;
+
+                        // Search forward (within 8 instructions) for movw ip + movt ip + blx ip
+                        uint32_t movw_val = 0, movt_val = 0;
+                        bool found_blx = false;
+                        for (size_t j = i + 1; j < i + 8 && j < code_size / 4; j++) {
+                            uint32_t w = code[j];
+                            if ((w & 0xFFF0F000) == 0xE300C000) // movw ip, #imm
+                                movw_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
+                            else if ((w & 0xFFF0F000) == 0xE340C000) // movt ip, #imm
+                                movt_val = ((w >> 4) & 0xF000) | (w & 0xFFF);
+                            else if (w == 0xE12FFF3C) { // blx ip
+                                found_blx = true;
+                                break;
+                            }
+                        }
+
+                        if (!found_blx || movw_val == 0)
+                            continue;
+
+                        uint32_t stub_addr = (movt_val << 16) | movw_val;
+                        uint32_t stub_off = stub_addr - code_start;
+                        if (stub_off >= code_size - 8)
+                            continue;
+
+                        uint32_t *stub = &code[stub_off / 4];
+                        if (stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E) {
+                            if (patched_offsets.insert(stub_off).second) {
+                                stub[0] = 0xE52DE004; // push {lr}
+                                stub[1] = 0xE12FFF30; // blx r0
+                                stub[2] = 0xE49DF004; // pop {pc}
+                                kernel.invalidate_jit_cache(code_start + stub_off, 12);
+                            }
+                        }
+                    }
+                    if (!patched_offsets.empty()) {
+                        LOG_INFO("Mono: patched {} callback invoker stubs", patched_offsets.size());
+                        for (auto off : patched_offsets) {
+                            LOG_INFO("  stub at 0x{:08X} (offset 0x{:X})", code_start + off, off);
+                        }
+                    }
+                }
+            }
+
+
             kernel.mono_data_start = segment_reloc_info[1].addr;
             LOG_INFO("Mono module detected: data segment @ 0x{:08X}", kernel.mono_data_start);
         }
