@@ -19,9 +19,6 @@
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
 
-#include <chrono>
-#include <thread>
-
 #include <kernel/types.h>
 #include <util/lock_and_find.h>
 #include <util/log.h>
@@ -625,33 +622,6 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
 
     std::unique_lock<std::mutex> mutex_lock(mutex->mutex);
 
-    // For lightweight mutexes, the user-space workarea is the source of truth.
-    // The guest fast-path (LDREX/STREX on workarea->owner) can acquire the lock
-    // without any kernel call. When the slow path (this function) is called,
-    // we MUST sync from the workarea first. Otherwise the kernel thinks the lock
-    // is free (mutex->lock_count == 0) when it's actually held via the fast path,
-    // allowing two threads to both "acquire" the lock.
-    if (weight == SyncWeight::Light && mutex->workarea) {
-        SceKernelLwMutexWork *wa = mutex->workarea.get(mem);
-        if (wa) {
-            uint32_t wa_owner = wa->owner;
-            int wa_lockCount = wa->lockCount;
-            if (wa_owner != 0 && mutex->lock_count == 0) {
-                // Fast path holds the lock but kernel doesn't know. Sync it.
-                const ThreadStatePtr fast_owner = kernel.get_thread(static_cast<SceUID>(wa_owner));
-                if (fast_owner) {
-                    mutex->owner = fast_owner;
-                    mutex->lock_count = (wa_lockCount > 0) ? wa_lockCount : 1;
-                }
-            } else if (wa_owner == 0 && mutex->lock_count > 0) {
-                // Fast path released but kernel doesn't know. Sync it.
-                // This can happen if the holder unlocked via fast-path STREX only.
-                mutex->owner = nullptr;
-                mutex->lock_count = 0;
-            }
-        }
-    }
-
     bool is_recursive = (mutex->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
 
     // Already owned
@@ -680,73 +650,7 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
             return RET_ERROR(SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN);
         }
 
-        // For lightweight mutexes, the holder may release via the user-space
-        // fast path (STREX on workarea->owner = 0) without calling kernel unlock.
-        // The kernel's condition variable would never be signaled in that case.
-        // Use a polling loop with short sleeps to detect fast-path releases.
-        if (weight == SyncWeight::Light && mutex->workarea) {
-            // Increment waiter count in workarea so the fast-path unlock knows
-            // to also call the kernel unlock (on real Vita, this triggers the
-            // kernel wake path). The unknown0 field at offset +4 is the waiter count.
-            SceKernelLwMutexWork *wa = mutex->workarea.get(mem);
-            wa->unknown0++;
-
-            mutex_lock.unlock();
-
-            // Poll until the workarea shows the lock is available
-            auto start = std::chrono::steady_clock::now();
-            while (true) {
-                wa = mutex->workarea.get(mem);
-                uint32_t wa_owner = wa->owner;
-
-                if (wa_owner == 0 || wa_owner == static_cast<uint32_t>(thread_id)) {
-                    // Lock is free (or recursive). Try to acquire.
-                    mutex_lock.lock();
-                    wa = mutex->workarea.get(mem);
-                    if (wa->owner == 0) {
-                        // Still free — take it
-                        mutex->lock_count = lock_count;
-                        mutex->owner = thread;
-                        wa->owner = thread_id;
-                        wa->lockCount = lock_count;
-                        wa->unknown0--; // decrement waiter count
-                        return SCE_KERNEL_OK;
-                    } else if (wa->owner == static_cast<uint32_t>(thread_id)) {
-                        // We already own it (recursive)
-                        mutex->lock_count += lock_count;
-                        mutex->owner = thread;
-                        wa->lockCount = mutex->lock_count;
-                        wa->unknown0--;
-                        return SCE_KERNEL_OK;
-                    }
-                    // Someone else grabbed it between our check and re-lock
-                    // Resync kernel state and keep polling
-                    const ThreadStatePtr new_owner = kernel.get_thread(static_cast<SceUID>(wa->owner));
-                    if (new_owner) {
-                        mutex->owner = new_owner;
-                        mutex->lock_count = wa->lockCount > 0 ? wa->lockCount : 1;
-                    }
-                    mutex_lock.unlock();
-                }
-
-                // Check timeout
-                if (timeout) {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - start).count();
-                    if (elapsed >= *timeout) {
-                        mutex_lock.lock();
-                        wa->unknown0--; // decrement waiter count
-                        mutex_lock.unlock();
-                        *timeout = 0;
-                        return RET_ERROR(SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-                    }
-                }
-
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-            }
-        }
-
-        // Sleep thread! (heavy mutex path — blocking wait with condition variable)
+        // Sleep thread!
         std::unique_lock<std::mutex> thread_lock(thread->mutex);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
@@ -805,21 +709,10 @@ int mutex_try_lock(KernelState &kernel, MemState &mem, const char *export_name, 
     return mutex_lock_impl(kernel, mem, export_name, thread_id, lock_count, mutex, weight, nullptr, true);
 }
 
-inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, int unlock_count, MutexPtr &mutex, SyncWeight weight) {
+inline static int mutex_unlock_impl(KernelState &kernel, const char *export_name, SceUID thread_id, int unlock_count, MutexPtr &mutex) {
     const ThreadStatePtr current_thread = kernel.get_thread(thread_id);
 
     const std::lock_guard<std::mutex> mutex_lock(mutex->mutex);
-
-    // For lightweight mutexes, sync from workarea first.
-    // The lock may have been acquired via user-space fast path (LDREX/STREX).
-    if (weight == SyncWeight::Light && mutex->workarea) {
-        SceKernelLwMutexWork *wa = mutex->workarea.get(mem);
-        if (wa && mutex->lock_count == 0 && wa->owner == static_cast<uint32_t>(thread_id)) {
-            // Fast-path acquired, kernel doesn't know. Sync.
-            mutex->owner = current_thread;
-            mutex->lock_count = (wa->lockCount > 0) ? wa->lockCount : 1;
-        }
-    }
 
     if (current_thread == mutex->owner) {
         if (unlock_count > mutex->lock_count) {
@@ -830,15 +723,6 @@ inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const ch
 
         if (mutex->lock_count == 0) {
             mutex->owner = nullptr;
-
-            // Update workarea for LwMutex
-            if (weight == SyncWeight::Light && mutex->workarea) {
-                SceKernelLwMutexWork *wa = mutex->workarea.get(mem);
-                if (wa) {
-                    wa->owner = 0;
-                    wa->lockCount = 0;
-                }
-            }
 
             if (!mutex->waiting_threads->empty()) {
                 const auto waiting_thread_data = *mutex->waiting_threads->begin();
@@ -851,23 +735,6 @@ inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const ch
                 mutex->waiting_threads->pop();
                 mutex->lock_count += waiting_lock_count;
                 mutex->owner = waiting_thread;
-
-                // Update workarea with the new owner
-                if (weight == SyncWeight::Light && mutex->workarea) {
-                    SceKernelLwMutexWork *wa = mutex->workarea.get(mem);
-                    if (wa) {
-                        wa->owner = waiting_thread_data.thread->id;
-                        wa->lockCount = mutex->lock_count;
-                    }
-                }
-            }
-        } else {
-            // Still held, just decremented. Update workarea.
-            if (weight == SyncWeight::Light && mutex->workarea) {
-                SceKernelLwMutexWork *wa = mutex->workarea.get(mem);
-                if (wa) {
-                    wa->lockCount = mutex->lock_count;
-                }
             }
         }
     }
@@ -875,7 +742,7 @@ inline static int mutex_unlock_impl(KernelState &kernel, MemState &mem, const ch
     return SCE_KERNEL_OK;
 }
 
-int mutex_unlock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, int unlock_count, SyncWeight weight) {
+int mutex_unlock(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, int unlock_count, SyncWeight weight) {
     assert(mutexid >= 0);
 
     MutexPtr mutex;
@@ -888,7 +755,7 @@ int mutex_unlock(KernelState &kernel, MemState &mem, const char *export_name, Sc
             mutex->waiting_threads->size());
     }
 
-    return mutex_unlock_impl(kernel, mem, export_name, thread_id, unlock_count, mutex, weight);
+    return mutex_unlock_impl(kernel, export_name, thread_id, unlock_count, mutex);
 }
 
 int mutex_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight) {
@@ -1373,7 +1240,7 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
 
     std::unique_lock<std::mutex> condition_variable_lock(condvar->mutex);
 
-    if (auto error = mutex_unlock_impl(kernel, mem, export_name, thread_id, 1, condvar->associated_mutex, weight))
+    if (auto error = mutex_unlock_impl(kernel, export_name, thread_id, 1, condvar->associated_mutex))
         return error;
 
     std::unique_lock<std::mutex> thread_lock(thread->mutex);
