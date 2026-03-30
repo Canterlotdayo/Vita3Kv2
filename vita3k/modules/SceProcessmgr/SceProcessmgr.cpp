@@ -116,15 +116,13 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
              tname, thread_id, param1, param2, pc, lr);
 
     if (thread && thread->name.find("Mono") != std::string::npos) {
-        LOG_ERROR("AbortHandler: Mono thread {} — blocking host thread forever", thread_id);
-        // Don't call suspend() (interferes with run_loop state).
-        // Don't return (abort() chain would call raise(SIGABRT) → corruption).
-        // Just block this host thread forever. The guest thread effectively dies
-        // but without corrupting Mono runtime state or the mutex.
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::hours(24));
-        }
-        return 0; // unreachable
+        // Mono assertions on Vita are non-fatal: g_assertion_message() logs to
+        // TTY and returns. The Mono runtime continues despite the assertion.
+        // Blocking the thread here kills critical Mono runtime threads (JIT
+        // registration, type initialization) causing cascading failures:
+        // incomplete vtable entries, null method pointers, and game crashes.
+        LOG_WARN("AbortHandler: Mono thread {} — assertion is non-fatal, continuing execution", thread_id);
+        return 0;
     }
 
     if (thread) {
