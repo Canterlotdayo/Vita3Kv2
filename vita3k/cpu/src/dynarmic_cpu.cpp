@@ -134,13 +134,13 @@ public:
             }
 
             // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // don't spin-wait — just halt execution and return. The thread will be
-            // re-run by run_loop(), re-fault on the same address, and retry the
-            // signal then. This avoids burning CPU in a 100µs poll loop that
-            // blocks the host core for seconds while the handler is busy.
+            // just return NOP and let the thread continue. Don't halt — that causes
+            // a busy-loop in run_loop. The fallback path below (PC=LR, r0=0) will
+            // handle it: the null call returns 0 to the caller, and the C# code
+            // handles it via its own null checks or re-faults later when the
+            // handler is free.
             if (parent->protocol) {
-                cpu->jit->HaltExecution();
-                return 0xE320F000;
+                // Fall through to the PC=LR fallback below
             }
 
             // Fallback for non-Mono games or when handler isn't ready:
@@ -240,9 +240,10 @@ public:
                     cpu->jit->HaltExecution();
                     return 0;
                 }
-                // Signal BLOCKED — halt and let run_loop re-execute.
-                // The thread will re-fault and retry the signal naturally.
-                cpu->jit->HaltExecution();
+                // Signal BLOCKED — don't halt (causes busy-loop in run_loop).
+                // Just return 0: the null read returns a zero value to the guest,
+                // which will either be handled by C# null checks or cause another
+                // fault later when the exception handler is free.
                 return 0;
             }
 
@@ -381,8 +382,7 @@ public:
                     cpu->jit->HaltExecution();
                     return;
                 }
-                // Signal BLOCKED — halt and let run_loop re-execute.
-                cpu->jit->HaltExecution();
+                // Signal BLOCKED — don't halt, just drop the write silently.
             }
             return;
         }
