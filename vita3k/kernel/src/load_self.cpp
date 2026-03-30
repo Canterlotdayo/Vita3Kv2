@@ -139,6 +139,13 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
         const ExportNids::iterator export_address = kernel.export_nids.find(nid);
         uint32_t *const stub = entry.get(mem);
 
+        if (kernel.debugger.log_imports) {
+            LOG_DEBUG("\t  stub @0x{:08X}: [0]=0x{:08X} [1]=0x{:08X} is_default={} export_found={}",
+                      entry.address(), stub[0], stub[1],
+                      (stub[0] == 0xE3E00000 && stub[1] == 0xE12FFF1E),
+                      (export_address != kernel.export_nids.end()));
+        }
+
         // On real Vita, import stubs are placed in a separate area by the loader.
         // In Vita3K, they go at the ELF-specified addresses, which can overlap
         // with internal functions (e.g. mono-vita's callback invokers).
