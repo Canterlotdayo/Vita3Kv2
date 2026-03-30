@@ -116,13 +116,13 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
              tname, thread_id, param1, param2, pc, lr);
 
     if (thread && thread->name.find("Mono") != std::string::npos) {
-        // Mono's g_assert() calls abort() which calls this handler.
-        // On real Vita hardware, these assertions never fire (no race conditions
-        // with 4 in-order cores). The production Mono build likely has assertions
-        // compiled out. The abort() chain (AbortHandler → ModuleExit → ExitThread)
-        // is neutralized: all three return 0 for Mono threads. The thread unwinds
-        // back through abort() and continues normal execution.
-        LOG_WARN("AbortHandler: Mono thread {} (ID: {}) — assertion non-fatal, continuing", tname, thread_id);
+        // Mono's g_assert calls g_assertion_message (noreturn) → abort() → here.
+        // Can't return 0: g_assertion_message is noreturn, no valid code after it.
+        // Can't block forever: kills critical threads holding locks.
+        // exit_delete: cleanly terminates just this thread. Other Mono threads
+        // continue. Any incomplete work (JIT, type init) gets retried by others.
+        LOG_WARN("AbortHandler: Mono thread {} (ID: {}) — terminating (assertion)", tname, thread_id);
+        thread->exit_delete(false);
         return 0;
     }
 

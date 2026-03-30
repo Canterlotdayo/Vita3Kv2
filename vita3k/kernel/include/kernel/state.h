@@ -77,8 +77,6 @@ using LoadedInternalSysmodules = std::vector<SceSysmoduleInternalModuleId>;
 struct CorenumAllocator {
     BitmapAllocator alloc;
     std::mutex lock;
-    int next_core_rr = 0;
-    std::size_t max_cores = 150;
 
     void set_max_core_count(const std::size_t max);
 
