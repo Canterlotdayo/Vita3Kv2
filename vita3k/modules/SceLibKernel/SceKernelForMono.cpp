@@ -71,8 +71,6 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
                     LOG_WARN("WaitExceptionForMono: thread {} status={} needs_resume={}",
                              prev_tid, static_cast<int>(prev_thread->status), needs_resume);
                 }
-                    needs_resume = (prev_thread->status == ThreadStatus::suspend);
-                }
                 if (needs_resume) {
                     LOG_WARN("WaitExceptionForMono: previous faulting thread {} still suspended — forcing resume (unhandled exception)", prev_tid);
                     prev_thread->resume();
