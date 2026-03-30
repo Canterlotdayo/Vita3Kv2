@@ -126,6 +126,24 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
         return 0;
     }
 
+    if (thread && thread->name.find("ExceptionHandler") != std::string::npos) {
+        // The ExceptionHandlerThread hit an assertion (e.g., jit_tls not found).
+        // It can't return from abort() (noreturn). Mark the handler as dead
+        // so future null pointer exceptions skip signaling and use the
+        // fallback path (PC=LR, r0=0) instead of blocking forever.
+        LOG_WARN("AbortHandler: ExceptionHandlerThread (ID: {}) — marking handler dead", thread_id);
+        {
+            std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
+            emuenv.kernel.mono_exception_handler_thread = 0;
+            emuenv.kernel.mono_exception_sema = 0;
+            emuenv.kernel.mono_exception_pending = false;
+        }
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::hours(24));
+        }
+        return 0;
+    }
+
     if (thread) {
         thread->exit_delete(false);
     }
