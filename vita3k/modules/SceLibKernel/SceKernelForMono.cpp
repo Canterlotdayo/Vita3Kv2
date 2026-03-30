@@ -60,19 +60,31 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     {
         std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
         SceUID prev_tid = emuenv.kernel.mono_exception_thread_id;
-        LOG_WARN("WaitExceptionForMono: auto-resume check: prev_tid={}", prev_tid);
         if (prev_tid != 0) {
             auto prev_thread = emuenv.kernel.get_thread(prev_tid);
-            if (prev_thread) {
+            if (prev_thread && prev_thread->cpu) {
+                // Check if the previous faulting thread is stuck at PC=0
+                // (Mono's callback didn't call SetThreadContext to fix the PC).
+                // This happens when the exception is in eboot code, not JIT code —
+                // Mono can't find JIT metadata and skips handling.
+                // Fix: set PC=LR to return from the null function call with r0=0.
+                Address pc = read_pc(*prev_thread->cpu);
+                if (pc < emuenv.mem.page_size) {
+                    Address lr = read_lr(*prev_thread->cpu);
+                    LOG_WARN("WaitExceptionForMono: thread {} stuck at PC=0x{:08X} (unhandled) — setting PC=LR=0x{:08X}, r0=0",
+                             prev_tid, pc, lr);
+                    write_pc(*prev_thread->cpu, lr);
+                    write_reg(*prev_thread->cpu, 0, 0); // r0 = 0 (null return)
+                }
+
+                // Also force-resume if still suspended
                 bool needs_resume = false;
                 {
                     std::lock_guard<std::mutex> tlock(prev_thread->mutex);
                     needs_resume = (prev_thread->status == ThreadStatus::suspend);
-                    LOG_WARN("WaitExceptionForMono: thread {} status={} needs_resume={}",
-                             prev_tid, static_cast<int>(prev_thread->status), needs_resume);
                 }
                 if (needs_resume) {
-                    LOG_WARN("WaitExceptionForMono: previous faulting thread {} still suspended — forcing resume (unhandled exception)", prev_tid);
+                    LOG_WARN("WaitExceptionForMono: previous faulting thread {} still suspended — forcing resume", prev_tid);
                     prev_thread->resume();
                 }
             }
