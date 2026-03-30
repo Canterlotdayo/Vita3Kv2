@@ -101,6 +101,8 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     }
 
     SceUID sema = emuenv.kernel.mono_exception_sema;
+
+wait_again:
     semaphore_wait(emuenv.kernel, export_name, thread_id, sema, 1, nullptr);
 
     SceUID faulting_tid;
@@ -114,6 +116,14 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
         fault_pc = emuenv.kernel.mono_exception_fault_pc;
         is_prefetch = emuenv.kernel.mono_exception_is_prefetch;
         emuenv.kernel.mono_exception_pending = false;
+    }
+
+    // Spurious wakeup or stale data — thread ID 0 is invalid.
+    // Mono would call psp2_get_thread_jit(0) → "thread not found" → assertion → handler dies.
+    // Skip processing and re-enter the wait loop.
+    if (faulting_tid == 0) {
+        LOG_WARN("WaitExceptionForMono: spurious wakeup (faulting_tid=0), re-entering wait");
+        goto wait_again;
     }
 
     // Wait for the faulting thread to actually reach suspend state.
