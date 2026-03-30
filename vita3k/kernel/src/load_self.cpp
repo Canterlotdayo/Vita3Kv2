@@ -224,6 +224,11 @@ static bool load_imports(const sce_module_info_raw &module, Ptr<const void> segm
             func_entry_table = long_imports->func_entry_table;
             var_nid_table = long_imports->var_nid_table;
             var_entry_table = long_imports->var_entry_table;
+        } else {
+            LOG_WARN("load_imports: UNKNOWN import entry size 0x{:X} at offset 0x{:X}, num_funcs={}, skipping!",
+                     imports->size,
+                     reinterpret_cast<const uint8_t *>(imports) - reinterpret_cast<const uint8_t *>(imports_begin),
+                     imports->num_syms_funcs);
         }
 
         std::string lib_name;
