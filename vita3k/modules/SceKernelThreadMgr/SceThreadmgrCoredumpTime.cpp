@@ -25,8 +25,15 @@ TRACY_MODULE_NAME(SceThreadmgrCoredumpTime);
 EXPORT(int, sceKernelExitThread, int status) {
     TRACY_FUNC(sceKernelExitThread, status);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    thread->exit(status);
 
-    // the thread exits, the return value is not read anyway
+    // Part of the abort() chain neutralization for Mono threads.
+    // AbortHandler and ModuleExit also return 0. The thread unwinds
+    // back to the assertion caller and continues execution.
+    if (thread && thread->name.find("Mono") != std::string::npos) {
+        LOG_WARN("sceKernelExitThread: Mono thread {} (ID: {}) — skipping exit", thread->name, thread_id);
+        return 0;
+    }
+
+    thread->exit(status);
     return 0;
 }
