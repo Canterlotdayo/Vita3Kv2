@@ -488,15 +488,13 @@ EXPORT(int, sceNetCtlCheckCallback) {
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
 
-    // TODO: Check if the network is connected
-    if (emuenv.net.state != 1) {
-        for (auto &callback : emuenv.netctl.callbacks) {
-            if (callback.pc != 0) {
-                thread->run_callback(callback.pc, { SCE_NET_CTL_EVENT_TYPE_DISCONNECTED, callback.arg });
-            }
-        }
-        emuenv.net.state = 1;
-    }
+    // On a real Vita without network connectivity, the state is always
+    // DISCONNECTED and no transition event fires. The callback should only
+    // fire on actual state TRANSITIONS (connected→disconnected), not when
+    // the device was never connected. Since Vita3K doesn't have real PSN
+    // connectivity, we skip firing the DISCONNECTED event entirely.
+    // Games that need offline mode handle it via sceNetCtlInetGetState
+    // returning DISCONNECTED (which we do).
 
     // Check if there are any adhoc events to notify
     if ((emuenv.netctl.adhocEvent != SCE_NET_CTL_EVENT_TYPE_NONE) && (emuenv.netctl.adhocEvent != emuenv.netctl.lastNotifiedAdhocEvent)) {
