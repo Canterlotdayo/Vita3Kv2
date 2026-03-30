@@ -565,26 +565,7 @@ EXPORT(int, _sceKernelLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_
     if (!workarea)
         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
 
-    SceKernelLwMutexWork *wa = workarea.get(emuenv.mem);
-    const auto lwmutexid = wa->uid;
-
-    // On real Vita, the LwMutex fast path uses LDREX/STREX on the workarea's
-    // 'owner' field. When the fast path succeeds, the kernel is never called.
-    // When it fails (contention), the guest calls this SVC (slow path).
-    //
-    // The kernel must check the workarea state: if another thread already
-    // holds the lock via the fast path, the kernel must wait for it to release.
-    // Without this, the kernel sees its own lock_count==0 and grants the lock
-    // to a second thread → both threads hold the "lock" → data races.
-    //
-    // Spin-wait until the workarea shows the mutex is free or owned by us.
-    // This is lightweight because the fast-path holder typically releases quickly.
-    uint32_t wa_owner = wa->owner;
-    while (wa_owner != 0 && wa_owner != static_cast<uint32_t>(thread_id)) {
-        std::this_thread::yield();
-        wa_owner = wa->owner;
-    }
-
+    const auto lwmutexid = workarea.get(emuenv.mem)->uid;
     return mutex_lock(emuenv.kernel, emuenv.mem, export_name, thread_id, lwmutexid, lock_count, ptimeout, SyncWeight::Light);
 }
 
