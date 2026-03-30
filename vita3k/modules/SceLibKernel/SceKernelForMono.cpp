@@ -60,12 +60,17 @@ EXPORT(int, sceKernelWaitExceptionForMono, int type, Ptr<uint32_t> pInfo, int fl
     {
         std::lock_guard<std::mutex> lock(emuenv.kernel.mono_exception_mutex);
         SceUID prev_tid = emuenv.kernel.mono_exception_thread_id;
+        LOG_WARN("WaitExceptionForMono: auto-resume check: prev_tid={}", prev_tid);
         if (prev_tid != 0) {
             auto prev_thread = emuenv.kernel.get_thread(prev_tid);
             if (prev_thread) {
                 bool needs_resume = false;
                 {
                     std::lock_guard<std::mutex> tlock(prev_thread->mutex);
+                    needs_resume = (prev_thread->status == ThreadStatus::suspend);
+                    LOG_WARN("WaitExceptionForMono: thread {} status={} needs_resume={}",
+                             prev_tid, static_cast<int>(prev_thread->status), needs_resume);
+                }
                     needs_resume = (prev_thread->status == ThreadStatus::suspend);
                 }
                 if (needs_resume) {
