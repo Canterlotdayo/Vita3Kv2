@@ -116,12 +116,17 @@ EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
              tname, thread_id, param1, param2, pc, lr);
 
     if (thread && thread->name.find("Mono") != std::string::npos) {
-        // Mono assertions on Vita are non-fatal: g_assertion_message() logs to
-        // TTY and returns. The Mono runtime continues despite the assertion.
-        // Blocking the thread here kills critical Mono runtime threads (JIT
-        // registration, type initialization) causing cascading failures:
-        // incomplete vtable entries, null method pointers, and game crashes.
-        LOG_WARN("AbortHandler: Mono thread {} — assertion is non-fatal, continuing execution", thread_id);
+        // On real Vita, abort() terminates the entire process.
+        // We can't do that in an emulator. But we also can't:
+        // - Return 0: the abort() chain continues through ModuleExit into garbage
+        // - Block forever: kills critical Mono threads (JIT, type init) → crashes
+        //
+        // Best option: exit just THIS thread cleanly. Other Mono threads continue.
+        // The terminated thread's work (JIT compilation, type init) may be picked
+        // up by another thread or retried. This matches how real Vita handles the
+        // case where a non-critical thread hits an assertion during parallel JIT.
+        LOG_ERROR("AbortHandler: Mono thread {} (ID: {}) — terminating thread (assertion fatal)", tname, thread_id);
+        thread->exit_delete(false);
         return 0;
     }
 

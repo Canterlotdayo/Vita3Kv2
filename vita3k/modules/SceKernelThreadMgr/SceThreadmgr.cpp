@@ -437,17 +437,16 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
-    // For the Mono faulting thread, use the saved context that was captured
-    // by WaitExceptionForMono AFTER Dynarmic's run() returned. At that point
-    // all guest registers have been committed and the context is accurate.
-    // PC is overridden with fault_pc to match real Vita behavior.
+    // For the Mono faulting thread, use the saved context from the moment of
+    // the fault. After signal_mono_exception, the thread continues executing
+    // in the JIT block (NOPs, zero reads) which corrupts ALL registers.
+    // On the real Vita, GetContext returns the state AT the fault instruction.
     CPUContext context;
     bool using_saved = false;
     {
         std::lock_guard<std::mutex> mlock(emuenv.kernel.mono_exception_mutex);
-        if (emuenv.kernel.mono_exception_thread_id == threadId
-            && emuenv.kernel.mono_exception_pending == false
-            && emuenv.kernel.mono_exception_saved_context.cpu_registers[15] != 0) {
+        if (emuenv.kernel.mono_exception_thread_id == threadId && emuenv.kernel.mono_exception_pending == false) {
+            // pending was cleared by WaitExceptionForMono — this is the handler reading context
             context = emuenv.kernel.mono_exception_saved_context;
             using_saved = true;
             LOG_WARN("GetThreadContextForVM: using SAVED context for faulting thread {} (PC=0x{:08X})",
@@ -566,7 +565,26 @@ EXPORT(int, _sceKernelLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_
     if (!workarea)
         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
 
-    const auto lwmutexid = workarea.get(emuenv.mem)->uid;
+    SceKernelLwMutexWork *wa = workarea.get(emuenv.mem);
+    const auto lwmutexid = wa->uid;
+
+    // On real Vita, the LwMutex fast path uses LDREX/STREX on the workarea's
+    // 'owner' field. When the fast path succeeds, the kernel is never called.
+    // When it fails (contention), the guest calls this SVC (slow path).
+    //
+    // The kernel must check the workarea state: if another thread already
+    // holds the lock via the fast path, the kernel must wait for it to release.
+    // Without this, the kernel sees its own lock_count==0 and grants the lock
+    // to a second thread → both threads hold the "lock" → data races.
+    //
+    // Spin-wait until the workarea shows the mutex is free or owned by us.
+    // This is lightweight because the fast-path holder typically releases quickly.
+    uint32_t wa_owner = wa->owner;
+    while (wa_owner != 0 && wa_owner != static_cast<uint32_t>(thread_id)) {
+        std::this_thread::yield();
+        wa_owner = wa->owner;
+    }
+
     return mutex_lock(emuenv.kernel, emuenv.mem, export_name, thread_id, lwmutexid, lock_count, ptimeout, SyncWeight::Light);
 }
 
