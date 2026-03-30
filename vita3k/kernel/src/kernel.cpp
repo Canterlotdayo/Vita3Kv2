@@ -45,17 +45,22 @@
 int CorenumAllocator::new_corenum() {
     const std::lock_guard<std::mutex> guard(lock);
 
-    uint32_t size = 1;
-    return alloc.allocate_from(0, size);
+    // Round-robin assignment across available cores (0 to max-1).
+    // Multiple threads share core_ids, matching real Vita behavior
+    // where threads are scheduled across 4 physical cores.
+    int core = next_core_rr % max_cores;
+    next_core_rr++;
+    return core;
 }
 
 void CorenumAllocator::free_corenum(const int num) {
-    const std::lock_guard<std::mutex> guard(lock);
-    alloc.free(num, 1);
+    // No-op: round-robin doesn't track individual allocations.
+    // Core IDs are shared and reused automatically.
 }
 
 void CorenumAllocator::set_max_core_count(const std::size_t max) {
     const std::lock_guard<std::mutex> guard(lock);
+    max_cores = max;
     alloc.set_maximum(max);
 }
 
@@ -127,7 +132,13 @@ KernelState::KernelState()
 }
 
 bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt) {
-    constexpr std::size_t MAX_CORE_COUNT = 150;
+    // Real Vita has 4 ARM Cortex-A9 cores (core 3 often reserved).
+    // Using 4 cores makes the ExclusiveMonitor behave like real hardware:
+    // threads sharing a core_id means their LDREX/STREX interact correctly.
+    // With 150 cores (one per thread), STREX race conditions can occur that
+    // don't happen on real hardware, causing issues in code that relies on
+    // LDREX/STREX for synchronization (e.g., Mono's critical sections).
+    constexpr std::size_t MAX_CORE_COUNT = 4;
 
     corenum_allocator.set_max_core_count(MAX_CORE_COUNT);
     exclusive_monitor = new_exclusive_monitor(MAX_CORE_COUNT);
