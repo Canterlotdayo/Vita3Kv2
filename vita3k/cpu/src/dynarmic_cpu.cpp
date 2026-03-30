@@ -134,13 +134,23 @@ public:
             }
 
             // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // just return NOP and let the thread continue. Don't halt — that causes
-            // a busy-loop in run_loop. The fallback path below (PC=LR, r0=0) will
-            // handle it: the null call returns 0 to the caller, and the C# code
-            // handles it via its own null checks or re-faults later when the
-            // handler is free.
+            // DON'T fall through to the NOP fallback — that corrupts the thread.
+            // On real Vita, each thread's exception is handled independently.
+            // We must wait for the pending exception to be processed, then retry.
             if (parent->protocol) {
-                // Fall through to the PC=LR fallback below
+                int wait_count = 0;
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return 0xE320F000;
+                    }
+                    if (++wait_count > 100000) { // 10 second timeout
+                        LOG_ERROR("Mono exception signal timeout for thread {} — falling through", parent->thread_id);
+                        break;
+                    }
+                }
             }
 
             // Fallback for non-Mono games or when handler isn't ready:
@@ -240,11 +250,20 @@ public:
                     cpu->jit->HaltExecution();
                     return 0;
                 }
-                // Signal BLOCKED — don't halt (causes busy-loop in run_loop).
-                // Just return 0: the null read returns a zero value to the guest,
-                // which will either be handled by C# null checks or cause another
-                // fault later when the exception handler is free.
-                return 0;
+                // Signal BLOCKED — wait and retry (same as MemoryReadCode fix)
+                int wait_count = 0;
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return 0;
+                    }
+                    if (++wait_count > 100000) {
+                        LOG_ERROR("Mono data exception signal timeout for thread {}", parent->thread_id);
+                        break;
+                    }
+                }
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
@@ -382,7 +401,20 @@ public:
                     cpu->jit->HaltExecution();
                     return;
                 }
-                // Signal BLOCKED — don't halt, just drop the write silently.
+                // Wait-retry if BLOCKED (same as MemoryReadCode)
+                int wait_count = 0;
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
+                        mono_exception_signaled = true;
+                        cpu->jit->HaltExecution();
+                        return;
+                    }
+                    if (++wait_count > 100000) {
+                        LOG_ERROR("Mono write exception signal timeout for thread {}", parent->thread_id);
+                        break;
+                    }
+                }
             }
             return;
         }
@@ -521,7 +553,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
     config.enable_cycle_counting = false;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
-    config.processor_id = core_id % 4; // ExclusiveMonitor sees 4 slots (real Vita = 4 cores)
+    config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
