@@ -138,7 +138,7 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     // With 150 cores (one per thread), STREX race conditions can occur that
     // don't happen on real hardware, causing issues in code that relies on
     // LDREX/STREX for synchronization (e.g., Mono's critical sections).
-    constexpr std::size_t MAX_CORE_COUNT = 4;
+    constexpr std::size_t MAX_CORE_COUNT = 150;
 
     corenum_allocator.set_max_core_count(MAX_CORE_COUNT);
     exclusive_monitor = new_exclusive_monitor(MAX_CORE_COUNT);
