@@ -266,7 +266,9 @@ bool ThreadState::run_loop() {
                     to_do = ThreadToDo::suspend;
                 } else {
                     cpu->pre_run_context = save_context(*cpu);
+                    kernel.cpu_run_limiter.acquire();
                     res = run(*cpu);
+                    kernel.cpu_run_limiter.release();
                 }
 
                 // handle svc call if this was what stopped the cpu

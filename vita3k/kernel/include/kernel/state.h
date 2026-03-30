@@ -142,6 +142,30 @@ struct KernelState {
     CPUProtocolPtr cpu_protocol;
     ExclusiveMonitorPtr exclusive_monitor;
 
+    // Limits concurrent guest CPU execution to match real Vita's 4 cores.
+    // With 150 core_ids (for Dynarmic ExclusiveMonitor compatibility),
+    // all threads can have unique core_ids for correct LDREX/STREX behavior.
+    // But actual parallel execution is limited to 4 threads at a time,
+    // preventing race conditions that don't occur on real hardware
+    // (where only 4 threads can physically execute simultaneously).
+    struct CpuRunLimiter {
+        std::mutex mutex;
+        std::condition_variable cv;
+        int running = 0;
+        static constexpr int MAX_CONCURRENT = 4;
+
+        void acquire() {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [this] { return running < MAX_CONCURRENT; });
+            running++;
+        }
+        void release() {
+            std::unique_lock<std::mutex> lock(mutex);
+            running--;
+            cv.notify_one();
+        }
+    } cpu_run_limiter;
+
     ObjectStore obj_store;
 
     // Mono JIT race condition workaround:
