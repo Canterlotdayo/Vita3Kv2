@@ -420,6 +420,7 @@ void ThreadState::suspend() {
     }
     to_do = ThreadToDo::suspend;
     stop(*cpu);
+    halt_execution(*cpu);
 }
 
 void ThreadState::resume(bool step) {
