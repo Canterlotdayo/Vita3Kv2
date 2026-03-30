@@ -184,6 +184,7 @@ struct KernelState {
     CPUContext mono_exception_saved_context;    // full CPU context at time of fault
     int mono_exception_blocked_count = 0;      // throttle counter for BLOCKED log messages
     bool mono_exception_skip_resume = false;   // when true, ResumeThreadForMono skips the resume
+    bool mono_exception_is_prefetch = false;   // true if PREFETCH abort, false if DATA abort
     std::set<SceUID> mono_exception_dead_threads; // threads that died on double-fault (like real Vita)
     bool mono_callback_invokers_patched = false;  // true after runtime callback invoker stubs are patched
     SceUID mono_exception_last_thread = 0;     // last thread that signaled (prevents PC=0 re-signal)
