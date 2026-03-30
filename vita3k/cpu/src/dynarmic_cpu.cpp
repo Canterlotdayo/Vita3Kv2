@@ -134,23 +134,13 @@ public:
             }
 
             // If Mono is loaded but signal was BLOCKED (another exception pending),
-            // DON'T fall through to the NOP fallback — that corrupts the thread.
-            // On real Vita, each thread's exception is handled independently.
-            // We must wait for the pending exception to be processed, then retry.
+            // don't spin-wait — just halt execution and return. The thread will be
+            // re-run by run_loop(), re-fault on the same address, and retry the
+            // signal then. This avoids burning CPU in a 100µs poll loop that
+            // blocks the host core for seconds while the handler is busy.
             if (parent->protocol) {
-                int wait_count = 0;
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, lr)) {
-                        mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return 0xE320F000;
-                    }
-                    if (++wait_count > 100000) { // 10 second timeout
-                        LOG_ERROR("Mono exception signal timeout for thread {} — falling through", parent->thread_id);
-                        break;
-                    }
-                }
+                cpu->jit->HaltExecution();
+                return 0xE320F000;
             }
 
             // Fallback for non-Mono games or when handler isn't ready:
@@ -250,20 +240,10 @@ public:
                     cpu->jit->HaltExecution();
                     return 0;
                 }
-                // Signal BLOCKED — wait and retry (same as MemoryReadCode fix)
-                int wait_count = 0;
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
-                        mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return 0;
-                    }
-                    if (++wait_count > 100000) {
-                        LOG_ERROR("Mono data exception signal timeout for thread {}", parent->thread_id);
-                        break;
-                    }
-                }
+                // Signal BLOCKED — halt and let run_loop re-execute.
+                // The thread will re-fault and retry the signal naturally.
+                cpu->jit->HaltExecution();
+                return 0;
             }
 
             // If the PC itself is in invalid/unmapped memory, halt immediately.
@@ -401,20 +381,8 @@ public:
                     cpu->jit->HaltExecution();
                     return;
                 }
-                // Wait-retry if BLOCKED (same as MemoryReadCode)
-                int wait_count = 0;
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    if (parent->protocol->signal_mono_exception(parent->thread_id, addr, pc)) {
-                        mono_exception_signaled = true;
-                        cpu->jit->HaltExecution();
-                        return;
-                    }
-                    if (++wait_count > 100000) {
-                        LOG_ERROR("Mono write exception signal timeout for thread {}", parent->thread_id);
-                        break;
-                    }
-                }
+                // Signal BLOCKED — halt and let run_loop re-execute.
+                cpu->jit->HaltExecution();
             }
             return;
         }
