@@ -553,7 +553,7 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
     config.enable_cycle_counting = false;
     config.global_monitor = monitor;
     config.coprocessors[15] = cp15;
-    config.processor_id = core_id % 4; // ExclusiveMonitor sees 4 slots (real Vita = 4 cores)
+    config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
